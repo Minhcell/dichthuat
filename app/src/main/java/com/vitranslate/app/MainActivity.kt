@@ -144,6 +144,15 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         spinner.adapter = ArrayAdapter(
             this, android.R.layout.simple_spinner_dropdown_item, langs.map { it.label }
         )
+        // LÀM NÓNG mô hình dịch 2 chiều ngay khi mở app / đổi ngôn ngữ:
+        // đến lúc bấm nút nói thì mô hình đã sẵn, dịch tức thì.
+        // (Lần đầu mỗi cặp ngôn ngữ cần mạng để tải ~30MB, sau đó offline mãi mãi)
+        spinner.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(
+                p: android.widget.AdapterView<*>?, v: android.view.View?, pos: Int, id: Long
+            ) = warmUpModels()
+            override fun onNothingSelected(p: android.widget.AdapterView<*>?) {}
+        }
 
         // TTS: ưu tiên Google (giọng Việt + ngoại ngữ chuẩn), lỗi thì dùng mặc định
         tts = try {
@@ -216,6 +225,26 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     /** Thời gian im lặng (ms) để coi là hết câu — chỉnh bằng thanh trượt */
     private var silenceMs = 1000
+
+    /** Chuẩn bị sẵn mô hình dịch Việt ↔ ngôn ngữ đang chọn (chạy nền, im lặng) */
+    private var warnedNoNetwork = false
+    private fun warmUpModels() {
+        val fo = selected.mlkit
+        TranslateHelper.translate("xin chào", "vi", fo,
+            onResult = { warnedNoNetwork = false },
+            onError = {
+                if (!warnedNoNetwork) {
+                    warnedNoNetwork = true
+                    runOnUiThread {
+                        appendSystemLog(
+                            "⚠️ Chưa tải được mô hình dịch ${selected.label} — cần MẠNG " +
+                            "cho lần đầu (~30MB). Bật Wi-Fi/4G rồi chọn lại ngôn ngữ."
+                        )
+                    }
+                }
+            })
+        TranslateHelper.translate("hello", fo, "vi", onResult = {}, onError = {})
+    }
 
     private fun silenceLabel(): String {
         val s = String.format(Locale.US, "%.1f", silenceMs / 1000.0).replace('.', ',')
@@ -324,6 +353,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     tvStatus.text = "Không nghe thấy gì, bấm nút nói lại"
                     return
                 }
+                // HIỆN NGAY câu nghe được — dù khâu dịch có chậm/kẹt thì
+                // phụ đề cuộc trao đổi vẫn luôn xuất hiện tức thì
+                appendSystemLog("🎙 Nghe được: \"$text\" — đang dịch…")
                 tvStatus.text = "Đang dịch…"
                 handleRecognized(text, viToForeign)
             }
@@ -356,11 +388,30 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         recognizer?.startListening(intent)
     }
 
+    /** Đếm lượt dịch — dùng cho bộ giám sát chống treo */
+    private var translateTurnId = 0
+
     /**
      * Câu nghe được → tự phát hiện ngôn ngữ (ML Kit) → dịch đúng chiều
      * → hiện 2 dòng (gốc + dịch) → đọc to bản dịch.
+     * Có bộ giám sát 12 giây: khâu dịch bị kẹt (thường do lần đầu phải tải
+     * mô hình dịch ~30MB mà mạng yếu) sẽ báo rõ vào ô hội thoại thay vì im lặng.
      */
     private fun handleRecognized(text: String, viToForeignPressed: Boolean) {
+        val myTurn = ++translateTurnId
+        var turnDone = false
+        ui.postDelayed({
+            if (myTurn == translateTurnId && !turnDone) {
+                turnDone = true
+                appendSystemLog(
+                    "⚠️ Dịch quá lâu — lần đầu với mỗi cặp ngôn ngữ cần MẠNG để tải " +
+                    "mô hình dịch (~30MB). Hãy kiểm tra Wi-Fi/4G rồi bấm nút nói lại. " +
+                    "Sau lần tải đầu sẽ dịch offline tức thì."
+                )
+                tvStatus.text = "Sẵn sàng"
+            }
+        }, 12000)
+
         TranslateHelper.identifyLanguage(text) { detected ->
             val isVietnamese = when (detected) {
                 "vi" -> true
@@ -373,6 +424,16 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             TranslateHelper.translate(text, src, dst,
                 onResult = { translated ->
                     runOnUiThread {
+                        if (turnDone) {
+                            // Giám sát đã báo lỗi rồi nhưng bản dịch về muộn:
+                            // vẫn hiện + đọc để không mất nội dung
+                            appendLog(isVietnamese, text, translated)
+                            if (switchSpeak.isChecked) {
+                                speak(translated, if (isVietnamese) selected.tts else Locale("vi", "VN"))
+                            }
+                            return@runOnUiThread
+                        }
+                        turnDone = true
                         appendLog(isVietnamese, text, translated)
                         tvStatus.text = "Sẵn sàng"
                         if (switchSpeak.isChecked) {
@@ -382,8 +443,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 },
                 onError = { err ->
                     runOnUiThread {
+                        turnDone = true
                         tvStatus.text = err
-                        appendSystemLog("❌ $err")
+                        appendSystemLog("❌ $err — kiểm tra kết nối mạng rồi thử lại")
                     }
                 }
             )
