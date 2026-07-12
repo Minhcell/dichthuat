@@ -152,13 +152,94 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     // ---------------- NHẬN DẠNG GIỌNG NÓI ----------------
 
-    private fun startListening(viToForeign: Boolean) {
+    /**
+     * SỬA LỖI 11/13 trên Xiaomi/HyperOS: máy gắn app vào dịch vụ nhận dạng
+     * MẶC ĐỊNH CỦA HÃNG (không hỗ trợ tiếng Việt) → lỗi 13 (ngôn ngữ không có)
+     * và 11 (mất kết nối dịch vụ). Hàm này tìm và KẾT NỐI THẲNG vào dịch vụ
+     * nhận dạng CỦA GOOGLE (app Google / Speech Services) thay vì dùng mặc định.
+     */
+    private var sttEngineIdx = 0
+
+    /**
+     * Danh sách ứng viên dịch vụ nhận dạng, xếp theo độ ưu tiên:
+     *  1. Dịch vụ ONLINE của app Google (GoogleRecognitionService) — chuẩn nhất,
+     *     hỗ trợ mọi ngôn ngữ, không cần tải gói offline
+     *  2. Các dịch vụ khác trong app Google
+     *  3. Dịch vụ mặc định của máy
+     *  4. Các dịch vụ Google khác (vd: bộ on-device của Android System Intelligence)
+     * Khi gặp lỗi 11/12/13, app XOAY sang ứng viên kế tiếp và thử lại.
+     */
+    private fun sttCandidates(): List<android.content.ComponentName?> {
+        val list = mutableListOf<android.content.ComponentName?>()
+        try {
+            val services = packageManager.queryIntentServices(
+                Intent(android.speech.RecognitionService.SERVICE_INTERFACE), 0
+            )
+            fun add(cn: android.content.ComponentName?) {
+                if (!list.contains(cn)) list.add(cn)
+            }
+            // (1) Dịch vụ online của app Google
+            services.firstOrNull {
+                it.serviceInfo.packageName == "com.google.android.googlequicksearchbox" &&
+                        it.serviceInfo.name.contains("GoogleRecognitionService")
+            }?.let { add(android.content.ComponentName(it.serviceInfo.packageName, it.serviceInfo.name)) }
+            // (2) Các dịch vụ khác trong app Google
+            services.filter { it.serviceInfo.packageName == "com.google.android.googlequicksearchbox" }
+                .forEach { add(android.content.ComponentName(it.serviceInfo.packageName, it.serviceInfo.name)) }
+            // (3) Mặc định của máy
+            add(null)
+            // (4) Các dịch vụ Google còn lại
+            services.filter { it.serviceInfo.packageName.startsWith("com.google.android") }
+                .forEach { add(android.content.ComponentName(it.serviceInfo.packageName, it.serviceInfo.name)) }
+        } catch (e: Exception) {
+            list.add(null)
+        }
+        if (list.isEmpty()) list.add(null)
+        return list
+    }
+
+    private fun createBestRecognizer(): SpeechRecognizer {
+        val cands = sttCandidates()
+        val cn = cands[sttEngineIdx % cands.size]
+        return try {
+            if (cn != null) SpeechRecognizer.createSpeechRecognizer(this, cn)
+            else SpeechRecognizer.createSpeechRecognizer(this)
+        } catch (e: Exception) {
+            SpeechRecognizer.createSpeechRecognizer(this)
+        }
+    }
+
+    /** Xoay sang dịch vụ nhận dạng kế tiếp (gọi khi gặp lỗi 11/12/13) */
+    private fun rotateSttEngine() {
+        sttEngineIdx = (sttEngineIdx + 1) % sttCandidates().size
+    }
+
+    /** Diễn giải mã lỗi nhận dạng thành thông báo dễ hiểu */
+    private fun sttErrorMsg(error: Int): String = when (error) {
+        1, 2 -> "Lỗi mạng khi nhận dạng — kiểm tra Internet rồi thử lại"
+        3 -> "Lỗi micro — kiểm tra quyền micro / tai nghe"
+        4, 11 -> "Dịch vụ nhận dạng bị ngắt (lỗi $error) — đang thử lại…"
+        5 -> "Lỗi trình nhận dạng (5) — thử lại"
+        8 -> "Trình nhận dạng đang bận (8) — đang thử lại…"
+        9 -> "Chưa cấp quyền micro"
+        10 -> "Quá nhiều yêu cầu (10) — chờ chút rồi thử lại"
+        12, 13 -> "Ngôn ngữ chưa có trong dịch vụ nhận dạng (lỗi $error). " +
+                "Hãy mở Play Store cập nhật app Google, rồi vào Cài đặt > " +
+                "Quản lý ứng dụng > Google > bật, và thử lại."
+        else -> "Lỗi nhận dạng ($error), thử lại"
+    }
+
+    /** Cho phép tự thử lại tối đa 2 lần (xoay engine) ở nút bấm thủ công */
+    private var manualRetries = 0
+
+    private fun startListening(viToForeign: Boolean, isRetry: Boolean = false) {
         if (!SpeechRecognizer.isRecognitionAvailable(this)) {
             toast("Máy chưa có dịch vụ nhận dạng giọng nói (cần app Google)")
             return
         }
+        if (!isRetry) manualRetries = 0
         recognizer?.destroy()
-        recognizer = SpeechRecognizer.createSpeechRecognizer(this)
+        recognizer = createBestRecognizer()
 
         val sttLang = if (viToForeign) "vi-VN" else selected.stt
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
@@ -169,6 +250,10 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, sttLang)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, sttLang)
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            // QUAN TRỌNG (sửa lỗi 13): ÉP nhận dạng ONLINE — Android 13+
+            // mặc định ưu tiên bộ on-device vốn đòi tải gói ngôn ngữ riêng
+            putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, false)
+            putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
         }
 
         tvStatus.text = getString(R.string.listening) +
@@ -191,11 +276,23 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             }
 
             override fun onError(error: Int) {
-                tvStatus.text = when (error) {
+                when (error) {
                     SpeechRecognizer.ERROR_NO_MATCH,
-                    SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "Không nghe rõ, hãy thử lại"
-                    SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Chưa cấp quyền micro"
-                    else -> "Lỗi nhận dạng ($error), thử lại"
+                    SpeechRecognizer.ERROR_SPEECH_TIMEOUT ->
+                        tvStatus.text = "Không nghe rõ, hãy thử lại"
+                    // Lỗi dịch vụ (bận/ngắt/thiếu ngôn ngữ): XOAY sang dịch vụ
+                    // nhận dạng kế tiếp rồi tự thử lại, tối đa 2 lần
+                    4, 5, 8, 11, 12, 13 -> {
+                        if (manualRetries < 2) {
+                            manualRetries++
+                            rotateSttEngine()
+                            tvStatus.text = "Đang đổi bộ nhận dạng (lỗi $error), nghe lại…"
+                            ui.postDelayed({ startListening(viToForeign, isRetry = true) }, 500)
+                        } else {
+                            tvStatus.text = sttErrorMsg(error)
+                        }
+                    }
+                    else -> tvStatus.text = sttErrorMsg(error)
                 }
             }
 
@@ -347,7 +444,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             android.media.ToneGenerator(android.media.AudioManager.STREAM_MUSIC, 85)
         } catch (e: Exception) { null }
 
-        autoRec = SpeechRecognizer.createSpeechRecognizer(this)
+        autoRec = createBestRecognizer() // kết nối thẳng dịch vụ Google (sửa lỗi 11/13)
         autoRec?.setRecognitionListener(autoListener)
 
         findViewById<Button>(R.id.btnAuto).text = "⏹ Dừng hội thoại tự động"
@@ -424,6 +521,24 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     tvStatus.text = "Chưa cấp quyền micro"
                     stopAutoMode()
                 }
+                4, 11, 12, 13 -> {
+                    // Dịch vụ nhận dạng lỗi / thiếu ngôn ngữ → XOAY sang dịch vụ
+                    // kế tiếp trong danh sách rồi thử lại; hết danh sách vẫn lỗi
+                    // (thử tối đa 4 lần) thì báo hướng dẫn và dừng
+                    autoErrStreak++
+                    if (autoErrStreak <= 4) {
+                        rotateSttEngine()
+                        appendSystemLog("🔄 Lỗi $error — đổi bộ nhận dạng, thử lại (${autoErrStreak}/4)…")
+                        autoRec?.destroy()
+                        autoRec = createBestRecognizer()
+                        autoRec?.setRecognitionListener(this)
+                        ui.postDelayed({ autoListenLoop() }, 600)
+                    } else {
+                        appendSystemLog("❌ " + sttErrorMsg(error))
+                        tvStatus.text = sttErrorMsg(error)
+                        stopAutoMode()
+                    }
+                }
                 else -> {
                     // BUSY / CLIENT / AUDIO…: KHÔNG đảo lượt, thử nghe lại.
                     // Lỗi 4 lần liên tiếp → tạo recognizer mới cho chắc.
@@ -432,7 +547,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     if (autoErrStreak >= 4) {
                         autoErrStreak = 0
                         autoRec?.destroy()
-                        autoRec = SpeechRecognizer.createSpeechRecognizer(this@MainActivity)
+                        autoRec = createBestRecognizer()
                         autoRec?.setRecognitionListener(this)
                     }
                     ui.postDelayed({ autoListenLoop() }, 500)
@@ -463,6 +578,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             // Ngắt câu nhanh hơn: im lặng 1 giây coi như nói xong → dịch ngay
             putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1000)
             putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1000)
+            // QUAN TRỌNG (sửa lỗi 13): ÉP nhận dạng ONLINE
+            putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, false)
+            putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
         }
 
         tvStatus.text = if (autoListenVi)
