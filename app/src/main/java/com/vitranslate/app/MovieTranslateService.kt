@@ -117,6 +117,10 @@ class MovieTranslateService : Service() {
         if (mode == MODE_VOICE) initTts()
         showOverlay("⏳ Đang nạp mô hình nhận dạng…")
 
+        // LÀM NÓNG mô hình dịch ngay từ đầu: câu thoại ĐẦU TIÊN của phim
+        // sẽ được dịch tức thì thay vì phải chờ kiểm tra/tải mô hình
+        TranslateHelper.translate("hello", srcLang, "vi", onResult = {}, onError = {})
+
         thread {
             try {
                 model = Model(modelPath)
