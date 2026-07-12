@@ -185,7 +185,46 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             } else BluetoothHelper.disableHeadsetMic(this)
         }
 
+        // ⏱ THANH CHỈNH ĐỘ NHẠY NGẮT CÂU (0,5 – 2,0 giây):
+        // Kéo TRÁI  = ngắt câu nhanh  → dịch phản hồi nhanh, nhưng ngập ngừng
+        //             giữa câu dễ bị cắt làm đôi.
+        // Kéo PHẢI = chờ lâu hơn      → nói được câu dài, chính xác hơn,
+        //             nhưng phải đợi lâu hơn sau khi ngừng nói.
+        // Giá trị được LƯU lại, lần sau mở app vẫn giữ nguyên.
+        val tvSilence = findViewById<TextView>(R.id.tvSilence)
+        val seekSilence = findViewById<android.widget.SeekBar>(R.id.seekSilence)
+        silenceMs = getSharedPreferences("vitranslate", MODE_PRIVATE)
+            .getInt("silence_ms", 1000)
+        seekSilence.progress = ((silenceMs - 500) / 100).coerceIn(0, 15)
+        tvSilence.text = silenceLabel()
+        seekSilence.setOnSeekBarChangeListener(object :
+            android.widget.SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(sb: android.widget.SeekBar?, p: Int, user: Boolean) {
+                silenceMs = 500 + p * 100
+                tvSilence.text = silenceLabel()
+            }
+            override fun onStartTrackingTouch(sb: android.widget.SeekBar?) {}
+            override fun onStopTrackingTouch(sb: android.widget.SeekBar?) {
+                getSharedPreferences("vitranslate", MODE_PRIVATE)
+                    .edit().putInt("silence_ms", silenceMs).apply()
+                toast("Ngắt câu sau ${silenceMs / 1000.0} giây im lặng")
+            }
+        })
+
         requestPermissions()
+    }
+
+    /** Thời gian im lặng (ms) để coi là hết câu — chỉnh bằng thanh trượt */
+    private var silenceMs = 1000
+
+    private fun silenceLabel(): String {
+        val s = String.format(Locale.US, "%.1f", silenceMs / 1000.0).replace('.', ',')
+        val hint = when {
+            silenceMs <= 800 -> "nhanh"
+            silenceMs >= 1500 -> "chính xác"
+            else -> "cân bằng"
+        }
+        return "⏱ Độ nhạy ngắt câu: $s giây ($hint)"
     }
 
     private fun requestPermissions() {
@@ -265,6 +304,9 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, sttLang)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, sttLang)
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            // Ngắt câu theo THANH TRƯỢT độ nhạy (0,5–2,0 giây im lặng)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, silenceMs)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, silenceMs)
             // Ép nhận dạng ONLINE (tránh lỗi 13 thiếu gói offline trên Android 13+)
             putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, false)
             putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
