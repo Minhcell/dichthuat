@@ -137,6 +137,25 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             }
         }
 
+        // Nút xóa nội dung hội thoại (nội dung được LƯU vĩnh viễn,
+        // chỉ mất khi bấm nút này)
+        findViewById<Button>(R.id.btnClearLog).setOnClickListener {
+            logBuf.setLength(0)
+            tvLog.text = ""
+            getSharedPreferences("vitranslate", MODE_PRIVATE)
+                .edit().remove("conv_log").apply()
+            toast("Đã xóa nội dung hội thoại")
+        }
+
+        // Khôi phục nội dung hội thoại của các lần trước
+        val saved = getSharedPreferences("vitranslate", MODE_PRIVATE)
+            .getString("conv_log", "") ?: ""
+        if (saved.isNotEmpty()) {
+            logBuf.append(saved)
+            tvLog.text = Html.fromHtml(saved, Html.FROM_HTML_MODE_LEGACY)
+            scroll.post { scroll.fullScroll(ScrollView.FOCUS_DOWN) }
+        }
+
         requestPermissions()
     }
 
@@ -607,14 +626,28 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
     }
 
+    /** Toàn bộ nội dung hội thoại (HTML) — lưu bền, chỉ mất khi bấm 🗑 Xóa */
+    private val logBuf = StringBuilder()
+
+    private fun persistLog(html: String) {
+        logBuf.append(html)
+        // Giới hạn 200KB để không phình vô hạn (cắt bớt phần cũ nhất)
+        if (logBuf.length > 200_000) logBuf.delete(0, logBuf.length - 150_000)
+        getSharedPreferences("vitranslate", MODE_PRIVATE)
+            .edit().putString("conv_log", logBuf.toString()).apply()
+    }
+
     private fun appendSystemLog(msg: String) {
-        tvLog.append(Html.fromHtml("<i>$msg</i><br><br>", Html.FROM_HTML_MODE_LEGACY))
+        val html = "<i>$msg</i><br><br>"
+        persistLog(html)
+        tvLog.append(Html.fromHtml(html, Html.FROM_HTML_MODE_LEGACY))
         scroll.post { scroll.fullScroll(ScrollView.FOCUS_DOWN) }
     }
 
     private fun appendLog(speakerVi: Boolean, original: String, translated: String) {
         val who = if (speakerVi) "🟢 Bạn" else "🔴 Khách"
         val html = "<b>$who:</b> $original<br><i>→ $translated</i><br><br>"
+        persistLog(html)
         tvLog.append(Html.fromHtml(html, Html.FROM_HTML_MODE_LEGACY))
         scroll.post { scroll.fullScroll(ScrollView.FOCUS_DOWN) }
     }
@@ -633,24 +666,45 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             } else {
                 toast("Không khởi động được Text-to-Speech. Hãy cài 'Speech Services by Google' từ Play Store.")
             }
+        } else if (autoMode) {
+            appendSystemLog("🔊 Giọng đọc đã sẵn sàng trở lại")
         }
     }
 
     /** Callback chờ TTS đọc xong (dùng cho chế độ hội thoại tự động) */
     private var pendingTtsDone: (() -> Unit)? = null
 
+    /** Khởi động lại TTS từ đầu khi phát hiện hỏng giữa chừng */
+    private fun reinitTts() {
+        ttsReady = false
+        triedDefaultEngine = false
+        try { tts?.shutdown() } catch (_: Exception) {}
+        tts = try {
+            TextToSpeech(this, this, "com.google.android.tts")
+        } catch (e: Exception) {
+            TextToSpeech(this, this)
+        }
+    }
+
     private fun speak(text: String, locale: Locale, onDone: (() -> Unit)? = null) {
-        if (!ttsReady) { onDone?.invoke(); return }
-        val res = tts?.setLanguage(locale)
-        if (res == TextToSpeech.LANG_MISSING_DATA || res == TextToSpeech.LANG_NOT_SUPPORTED) {
-            toast("TTS chưa hỗ trợ giọng ${locale.displayLanguage}. Vào Cài đặt > Chuyển văn bản thành giọng nói để tải thêm.")
+        if (!ttsReady) {
+            // Không im lặng bỏ qua nữa — báo rõ và tự khởi động lại giọng đọc
+            appendSystemLog("⚠️ Giọng đọc chưa sẵn sàng — đang khởi động lại, câu sau sẽ có tiếng…")
+            reinitTts()
             onDone?.invoke()
             return
         }
-        // SỬA LỖI QUAN TRỌNG (hội thoại tự động kẹt ở tiếng Việt):
-        // Gắn bộ báo "đọc xong" MỖI LẦN đọc — vì đối tượng TTS có thể đã bị
-        // thay bằng engine dự phòng, cờ "đã gắn 1 lần" khiến engine mới
-        // KHÔNG có bộ báo → không bao giờ chuyển lượt sang ngoại ngữ.
+        val res = tts?.setLanguage(locale)
+        if (res == TextToSpeech.LANG_MISSING_DATA || res == TextToSpeech.LANG_NOT_SUPPORTED) {
+            appendSystemLog(
+                "❌ Máy thiếu giọng đọc ${locale.displayLanguage}. " +
+                "Cài 'Speech Services by Google' từ Play Store rồi vào Cài đặt > " +
+                "Chuyển văn bản thành giọng nói > chọn Google."
+            )
+            onDone?.invoke()
+            return
+        }
+        // Gắn bộ báo "đọc xong" MỖI LẦN đọc (engine có thể đã bị thay)
         tts?.setOnUtteranceProgressListener(object :
             android.speech.tts.UtteranceProgressListener() {
             override fun onStart(id: String?) {}
@@ -663,11 +717,26 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             }
         })
         pendingTtsDone = onDone
-        tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "vt_${System.nanoTime()}")
 
-        // LƯỚI AN TOÀN: nếu vì bất kỳ lý do gì bộ báo không nổ (engine lạ),
-        // tự coi là đọc xong sau thời lượng ước tính (90ms/ký tự + 2 giây)
-        // → vòng lặp hội thoại tự động KHÔNG BAO GIỜ kẹt lượt nữa
+        // Đọc ở âm lượng tối đa của kênh media
+        val params = android.os.Bundle().apply {
+            putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f)
+        }
+        val rc = tts?.speak(text, TextToSpeech.QUEUE_FLUSH, params, "vt_${System.nanoTime()}")
+            ?: TextToSpeech.ERROR
+
+        // KIỂM TRA MÃ TRẢ VỀ: engine chết ngầm sẽ trả ERROR mà không báo gì —
+        // đây là lý do "không dịch thành tiếng" mà app vẫn chạy bình thường
+        if (rc != TextToSpeech.SUCCESS) {
+            appendSystemLog("❌ Giọng đọc bị lỗi (mã $rc) — đang khởi động lại, câu sau sẽ có tiếng…")
+            pendingTtsDone = null
+            reinitTts()
+            onDone?.invoke()
+            return
+        }
+
+        // LƯỚI AN TOÀN: engine không phát tín hiệu "đọc xong" → tự hoàn tất
+        // sau thời lượng ước tính, vòng lặp tự động không bao giờ kẹt
         if (onDone != null) {
             val estMs = (text.length * 90L + 2000L).coerceAtMost(15000L)
             ui.postDelayed({
