@@ -30,6 +30,20 @@
         android:text="Đọc to bản dịch (TTS)" />
 
     <TextView
+        android:id="@+id/tvSilence"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:paddingTop="4dp"
+        android:text="⏱ Độ nhạy ngắt câu: 1,0 giây"
+        android:textSize="13sp" />
+
+    <SeekBar
+        android:id="@+id/seekSilence"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:max="15" />
+
+    <TextView
         android:id="@+id/tvStatus"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
