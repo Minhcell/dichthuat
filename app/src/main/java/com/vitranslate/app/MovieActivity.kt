@@ -52,6 +52,10 @@ class MovieActivity : AppCompatActivity() {
         MovieLang("🇺🇦 Tiếng Ukraina", "uk", "vosk-model-small-uk-v3-small"),
         MovieLang("🇨🇿 Tiếng Séc", "cs", "vosk-model-small-cs-0.4-rhasspy"),
         MovieLang("🇮🇷 Tiếng Ba Tư (Iran)", "fa", "vosk-model-small-fa-0.5"),
+        MovieLang("🇸🇪 Tiếng Thụy Điển", "sv", "vosk-model-small-sv-rhasspy-0.15"),
+        MovieLang("🏴 Tiếng Catalan", "ca", "vosk-model-small-ca-0.4"),
+        MovieLang("🇮🇳 Tiếng Gujarati", "gu", "vosk-model-small-gu-0.42"),
+        MovieLang("🇮🇳 Tiếng Telugu", "te", "vosk-model-small-te-0.42"),
     )
 
     private lateinit var spinner: Spinner
