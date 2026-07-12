@@ -269,6 +269,10 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, sttLang)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, sttLang)
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            // Chốt câu nhanh: im lặng 1 giây coi như nói xong → dịch ngay
+            // (mặc định hệ thống chờ ~2 giây, làm phản hồi chậm hẳn)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1000)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1000)
             // QUAN TRỌNG (sửa lỗi 13): ÉP nhận dạng ONLINE — Android 13+
             // mặc định ưu tiên bộ on-device vốn đòi tải gói ngôn ngữ riêng
             putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, false)
