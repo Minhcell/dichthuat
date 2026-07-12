@@ -330,7 +330,10 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             ui.postDelayed({
                 if (autoMode && myTurn == autoTurnId && !turnDone) {
                     turnDone = true
-                    appendSystemLog("⚠️ Dịch quá lâu (mạng chậm hoặc đang tải mô hình dịch lần đầu ~30MB). Tiếp tục nghe…")
+                    appendSystemLog("⚠️ Dịch/đọc quá lâu — tự chuyển lượt và nghe tiếp…")
+                    // Chuyển lượt cho người kia (không kẹt mãi một thứ tiếng)
+                    autoListenVi = !autoListenVi
+                    beep()
                     autoListenLoop()
                 }
             }, 15000)
@@ -416,6 +419,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private var autoListenVi = true // lượt hiện tại: true = đang chờ tiếng Việt
     private var autoRec: SpeechRecognizer? = null
     private var autoErrStreak = 0
+    private var silentCount = 0 // số lần im lặng liên tiếp trong một lượt
     private val ui = android.os.Handler(android.os.Looper.getMainLooper())
     private var beeper: android.media.ToneGenerator? = null
 
@@ -440,6 +444,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         autoMode = true
         autoListenVi = startWithVi
         autoErrStreak = 0
+        silentCount = 0
         beeper = try {
             android.media.ToneGenerator(android.media.AudioManager.STREAM_MUSIC, 85)
         } catch (e: Exception) { null }
@@ -487,6 +492,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         override fun onResults(results: Bundle) {
             if (!autoMode) return
             autoErrStreak = 0
+            silentCount = 0
             val text = results
                 .getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                 ?.firstOrNull()
@@ -511,10 +517,16 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             when (error) {
                 SpeechRecognizer.ERROR_NO_MATCH,
                 SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> {
-                    // Lượt này không ai nói → bíp + đảo lượt nghe
+                    // Không ai nói ở lượt này. Chờ đủ 2 lần im lặng liên tiếp
+                    // (~10 giây) mới đảo lượt — để người nói có thời gian
+                    // suy nghĩ/mở lời, không bị "cướp lượt" giữa chừng
                     autoErrStreak = 0
-                    autoListenVi = !autoListenVi
-                    beep()
+                    silentCount++
+                    if (silentCount >= 2) {
+                        silentCount = 0
+                        autoListenVi = !autoListenVi
+                        beep()
+                    }
                     ui.postDelayed({ autoListenLoop() }, 350)
                 }
                 SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {
@@ -626,7 +638,6 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     /** Callback chờ TTS đọc xong (dùng cho chế độ hội thoại tự động) */
     private var pendingTtsDone: (() -> Unit)? = null
-    private var ttsListenerSet = false
 
     private fun speak(text: String, locale: Locale, onDone: (() -> Unit)? = null) {
         if (!ttsReady) { onDone?.invoke(); return }
@@ -636,22 +647,36 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             onDone?.invoke()
             return
         }
-        if (!ttsListenerSet) {
-            ttsListenerSet = true
-            tts?.setOnUtteranceProgressListener(object :
-                android.speech.tts.UtteranceProgressListener() {
-                override fun onStart(id: String?) {}
-                override fun onDone(id: String?) {
-                    runOnUiThread { pendingTtsDone?.invoke(); pendingTtsDone = null }
-                }
-                @Deprecated("Deprecated in Java")
-                override fun onError(id: String?) {
-                    runOnUiThread { pendingTtsDone?.invoke(); pendingTtsDone = null }
-                }
-            })
-        }
+        // SỬA LỖI QUAN TRỌNG (hội thoại tự động kẹt ở tiếng Việt):
+        // Gắn bộ báo "đọc xong" MỖI LẦN đọc — vì đối tượng TTS có thể đã bị
+        // thay bằng engine dự phòng, cờ "đã gắn 1 lần" khiến engine mới
+        // KHÔNG có bộ báo → không bao giờ chuyển lượt sang ngoại ngữ.
+        tts?.setOnUtteranceProgressListener(object :
+            android.speech.tts.UtteranceProgressListener() {
+            override fun onStart(id: String?) {}
+            override fun onDone(id: String?) {
+                runOnUiThread { pendingTtsDone?.invoke(); pendingTtsDone = null }
+            }
+            @Deprecated("Deprecated in Java")
+            override fun onError(id: String?) {
+                runOnUiThread { pendingTtsDone?.invoke(); pendingTtsDone = null }
+            }
+        })
         pendingTtsDone = onDone
         tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "vt_${System.nanoTime()}")
+
+        // LƯỚI AN TOÀN: nếu vì bất kỳ lý do gì bộ báo không nổ (engine lạ),
+        // tự coi là đọc xong sau thời lượng ước tính (90ms/ký tự + 2 giây)
+        // → vòng lặp hội thoại tự động KHÔNG BAO GIỜ kẹt lượt nữa
+        if (onDone != null) {
+            val estMs = (text.length * 90L + 2000L).coerceAtMost(15000L)
+            ui.postDelayed({
+                if (pendingTtsDone === onDone) {
+                    pendingTtsDone = null
+                    onDone.invoke()
+                }
+            }, estMs)
+        }
     }
 
     private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
