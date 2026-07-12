@@ -83,9 +83,6 @@ class MovieTranslateService : Service() {
     // Các câu dịch xong TRƯỚC khi TTS khởi động kịp → giữ lại đọc sau
     private val earlyQueue = ArrayDeque<String>()
 
-    // ----- Hàng đợi phụ đề song ngữ (hiện chậm, đọc kịp) -----
-    private val subQueue = ArrayDeque<SubPair>()
-    private var subShowing = false
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -118,7 +115,7 @@ class MovieTranslateService : Service() {
         }, ui)
 
         if (mode == MODE_VOICE) initTts()
-        else showOverlay("⏳ Đang nạp mô hình nhận dạng…")
+        showOverlay("⏳ Đang nạp mô hình nhận dạng…")
 
         thread {
             try {
@@ -126,9 +123,7 @@ class MovieTranslateService : Service() {
                 recognizer = Recognizer(model, SAMPLE_RATE.toFloat())
                 startAudioCapture()
             } catch (e: Exception) {
-                ui.post {
-                    if (mode == MODE_SUBTITLE) showOverlay("❌ Lỗi nạp mô hình: ${e.message}")
-                }
+                ui.post { showOverlay("❌ Lỗi nạp mô hình: ${e.message}") }
             }
         }
     }
@@ -261,9 +256,7 @@ class MovieTranslateService : Service() {
 
         audioRecord?.startRecording()
         running = true
-        ui.post {
-            if (mode == MODE_SUBTITLE) showOverlay("🎬 Sẵn sàng. Hãy phát phim/video…")
-        }
+        ui.post { showOverlay("🎬 Sẵn sàng. Hãy phát phim/video…") }
 
         val buf = ByteArray(4096)
         while (running) {
@@ -274,13 +267,13 @@ class MovieTranslateService : Service() {
                 // Câu hoàn chỉnh → dịch
                 val text = JSONObject(rec.result).optString("text")
                 if (text.isNotBlank()) translateFinal(text)
-            } else if (mode == MODE_SUBTITLE) {
+            } else {
                 // Câu đang nói dở: chỉ hiện khi CHƯA có phụ đề nào trên màn hình
                 // (không đè mất các cặp câu song ngữ người xem đang đọc)
                 val partial = JSONObject(rec.partialResult).optString("partial")
                 if (partial.isNotBlank()) {
                     ui.post {
-                        if (visiblePairs.isEmpty() && !subShowing && subQueue.isEmpty()) {
+                        if (visiblePairs.isEmpty()) {
                             overlayView?.text = "… $partial"
                         }
                     }
@@ -292,8 +285,11 @@ class MovieTranslateService : Service() {
     private fun translateFinal(text: String) {
         TranslateHelper.translate(text, srcLang, "vi",
             onResult = { vi ->
+                // CẢ HAI CHẾ ĐỘ đều hiện phụ đề song ngữ (gốc + Việt).
+                // Phụ đề hiện NGAY khi dịch xong — ở chế độ đọc tiếng, chữ hiện
+                // trước cả khi giọng đọc bắt đầu, giúp theo kịp thoại dễ hơn.
+                ui.post { enqueueSubtitle(text, vi) }
                 if (mode == MODE_VOICE) speakVi(vi)
-                else ui.post { enqueueSubtitle(text, vi) }
             },
             onError = { err ->
                 if (mode == MODE_SUBTITLE) ui.post { showOverlay(err) }
@@ -351,7 +347,7 @@ class MovieTranslateService : Service() {
         tts?.speak(text, queueMode, params, "movie_${System.nanoTime()}")
     }
 
-    // ---------------- 📖 CHẾ ĐỘ PHỤ ĐỀ SONG NGỮ (cuộn chậm) ----------------
+    // ---------------- 📖 PHỤ ĐỀ SONG NGỮ (hiện tức thì) ----------------
 
     /** Một cặp phụ đề: câu gốc tiếng nước ngoài + bản dịch tiếng Việt */
     private data class SubPair(val orig: String, val vi: String)
@@ -360,31 +356,17 @@ class MovieTranslateService : Service() {
     private val visiblePairs = ArrayDeque<SubPair>()
 
     /**
-     * Phụ đề SONG NGỮ kiểu cuộn:
-     *  - Mỗi câu hiện 2 dòng: dòng trên là tiếng gốc (vàng), dòng dưới tiếng Việt (trắng).
-     *  - Màn hình giữ tối đa 2 cặp câu; khi câu thứ 3 xuất hiện, cặp cũ nhất
-     *    trôi lên mất — như chạy chữ chậm, luôn có câu trước đó để đọc kịp.
-     *  - Mỗi cặp mới giữ tối thiểu 1,8s + 60ms/ký tự tiếng Việt (tối đa 8s)
-     *    trước khi cặp tiếp theo được đẩy vào; dồn quá 3 cặp thì bỏ cặp cũ nhất.
+     * HIỆN NGAY khi người trong phim nói xong câu nào:
+     *  - Câu vừa nói hiện lập tức 2 dòng: tiếng gốc (vàng) + tiếng Việt (trắng đậm).
+     *  - Câu TRƯỚC ĐÓ vẫn giữ trên màn hình (mờ hơn, phía trên) để đọc kịp;
+     *    khi câu thứ 3 xuất hiện, câu đầu tiên mới trôi đi.
+     *  → Không còn hàng đợi giữ chậm: người A nói xong hiện liền cặp câu của A;
+     *    người B nói tiếp là hiện liền cặp câu của B ngay bên dưới.
      */
     private fun enqueueSubtitle(orig: String, vi: String) {
-        subQueue.addLast(SubPair(orig, vi))
-        while (subQueue.size > 3) subQueue.removeFirst()
-        pumpSubtitle()
-    }
-
-    private fun pumpSubtitle() {
-        if (subShowing) return
-        val next = subQueue.removeFirstOrNull() ?: return
-        subShowing = true
-        visiblePairs.addLast(next)
+        visiblePairs.addLast(SubPair(orig, vi))
         while (visiblePairs.size > 2) visiblePairs.removeFirst() // câu cũ nhất trôi đi
         renderPairs()
-        val durMs = (1800L + next.vi.length * 60L).coerceAtMost(8000L)
-        ui.postDelayed({
-            subShowing = false
-            pumpSubtitle()
-        }, durMs)
     }
 
     /** Vẽ các cặp câu: tiếng gốc màu vàng, tiếng Việt màu trắng; cặp cũ mờ hơn */
@@ -467,9 +449,7 @@ class MovieTranslateService : Service() {
         tts?.stop(); tts?.shutdown(); tts = null
         duckMovieAudio(false) // trả lại âm lượng phim
         ui.post {
-            subQueue.clear()
             visiblePairs.clear()
-            subShowing = false
             removeOverlay()
         }
         stopForeground(STOP_FOREGROUND_REMOVE)
