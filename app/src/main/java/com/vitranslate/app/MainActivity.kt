@@ -3,6 +3,10 @@ package com.vitranslate.app
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.MediaCodec
+import android.media.MediaExtractor
+import android.media.MediaFormat
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.speech.RecognitionListener
@@ -16,22 +20,34 @@ import android.widget.ScrollView
 import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import com.google.android.material.switchmaterial.SwitchMaterial
+import org.json.JSONObject
+import org.vosk.Model
+import org.vosk.Recognizer
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
 import java.util.Locale
+import java.util.zip.ZipInputStream
+import kotlin.concurrent.thread
 
 /**
- * CHẾ ĐỘ HỘI THOẠI 2 CHIỀU:
- *  - Bấm nút xanh  → bạn nói tiếng Việt → app dịch sang ngoại ngữ đã chọn + đọc to.
- *  - Bấm nút đỏ    → người nước ngoài nói → app dịch sang tiếng Việt + đọc to.
- *  - Có ML Kit Language ID: nếu bấm nhầm nút, app tự phát hiện ngôn ngữ
- *    thật của câu nói và đảo chiều dịch cho đúng.
- *  - Bật công tắc Bluetooth để dùng micro của tai nghe Bluetooth.
+ * MÀN HÌNH HỘI THOẠI:
+ *  - Nút XANH: bấm → ghi âm bạn nói tiếng Việt → dịch sang ngoại ngữ đã chọn
+ *    → hiện 2 dòng (gốc + dịch) trong ô hội thoại → đọc to bản dịch.
+ *  - Nút ĐỎ: người kia nói ngoại ngữ → dịch sang tiếng Việt → hiện + đọc to.
+ *  - Nút 🎵: chọn file ghi âm trong máy → nhận dạng bằng Vosk (offline)
+ *    → dịch → hiện phụ đề + đọc to.
+ *  - Nội dung hội thoại LƯU VĨNH VIỄN, chỉ mất khi bấm 🗑 Xóa.
  */
 class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
-    // Danh sách ngoại ngữ: (Tên hiển thị, mã STT BCP-47, mã ML Kit, Locale TTS)
     data class Lang(val label: String, val stt: String, val mlkit: String, val tts: Locale)
 
     private val langs = listOf(
@@ -73,6 +89,28 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         Lang("🇰🇪 Tiếng Swahili", "sw-KE", "sw", Locale("sw", "KE")),
     )
 
+    /** Mô hình Vosk (nhận dạng offline cho FILE ghi âm) theo mã ML Kit */
+    private val voskModels = mapOf(
+        "vi" to "vosk-model-small-vn-0.4",
+        "en" to "vosk-model-small-en-us-0.15",
+        "zh" to "vosk-model-small-cn-0.22",
+        "ja" to "vosk-model-small-ja-0.22",
+        "ko" to "vosk-model-small-ko-0.22",
+        "fr" to "vosk-model-small-fr-0.22",
+        "de" to "vosk-model-small-de-0.15",
+        "es" to "vosk-model-small-es-0.42",
+        "ru" to "vosk-model-small-ru-0.22",
+        "it" to "vosk-model-small-it-0.22",
+        "pt" to "vosk-model-small-pt-0.3",
+        "nl" to "vosk-model-small-nl-0.22",
+        "tr" to "vosk-model-small-tr-0.3",
+        "hi" to "vosk-model-small-hi-0.22",
+        "pl" to "vosk-model-small-pl-0.22",
+        "uk" to "vosk-model-small-uk-v3-small",
+        "cs" to "vosk-model-small-cs-0.4-rhasspy",
+        "fa" to "vosk-model-small-fa-0.5",
+    )
+
     private lateinit var spinner: Spinner
     private lateinit var tvLog: TextView
     private lateinit var tvStatus: TextView
@@ -83,8 +121,14 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private var recognizer: SpeechRecognizer? = null
     private var tts: TextToSpeech? = null
     private var ttsReady = false
+    private var triedDefaultEngine = false
 
+    private val ui = android.os.Handler(android.os.Looper.getMainLooper())
     private val selected get() = langs[spinner.selectedItemPosition]
+
+    // ================================================================
+    //                          KHỞI TẠO
+    // ================================================================
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -101,28 +145,34 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             this, android.R.layout.simple_spinner_dropdown_item, langs.map { it.label }
         )
 
-        // Ưu tiên Google TTS (có giọng tiếng Việt và nhiều ngoại ngữ chuẩn);
-        // nếu máy không có/bị tắt thì onInit sẽ tự chuyển sang engine mặc định
+        // TTS: ưu tiên Google (giọng Việt + ngoại ngữ chuẩn), lỗi thì dùng mặc định
         tts = try {
             TextToSpeech(this, this, "com.google.android.tts")
         } catch (e: Exception) {
             TextToSpeech(this, this)
         }
 
-        findViewById<Button>(R.id.btnVi).setOnClickListener {
-            stopAutoMode()
-            startListening(viToForeign = true)
-        }
-        findViewById<Button>(R.id.btnForeign).setOnClickListener {
-            stopAutoMode()
-            startListening(viToForeign = false)
-        }
-        findViewById<Button>(R.id.btnAuto).setOnClickListener {
-            if (autoMode) stopAutoMode() else chooseStartLanguage()
-        }
+        findViewById<Button>(R.id.btnVi).setOnClickListener { startListening(true) }
+        findViewById<Button>(R.id.btnForeign).setOnClickListener { startListening(false) }
+        findViewById<Button>(R.id.btnFile).setOnClickListener { pickFileFlow() }
         findViewById<Button>(R.id.btnMovie).setOnClickListener {
-            stopAutoMode()
             startActivity(Intent(this, MovieActivity::class.java))
+        }
+
+        // Nội dung hội thoại LƯU VĨNH VIỄN — chỉ mất khi bấm nút này
+        findViewById<Button>(R.id.btnClearLog).setOnClickListener {
+            logBuf.setLength(0)
+            tvLog.text = ""
+            getSharedPreferences("vitranslate", MODE_PRIVATE)
+                .edit().remove("conv_log").apply()
+            toast("Đã xóa nội dung hội thoại")
+        }
+        val saved = getSharedPreferences("vitranslate", MODE_PRIVATE)
+            .getString("conv_log", "") ?: ""
+        if (saved.isNotEmpty()) {
+            logBuf.append(saved)
+            tvLog.text = Html.fromHtml(saved, Html.FROM_HTML_MODE_LEGACY)
+            scroll.post { scroll.fullScroll(ScrollView.FOCUS_DOWN) }
         }
 
         switchBt.setOnCheckedChangeListener { _, on ->
@@ -132,28 +182,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     toast("Không tìm thấy tai nghe Bluetooth đã kết nối")
                     switchBt.isChecked = false
                 } else toast("Đang dùng micro tai nghe Bluetooth")
-            } else {
-                BluetoothHelper.disableHeadsetMic(this)
-            }
-        }
-
-        // Nút xóa nội dung hội thoại (nội dung được LƯU vĩnh viễn,
-        // chỉ mất khi bấm nút này)
-        findViewById<Button>(R.id.btnClearLog).setOnClickListener {
-            logBuf.setLength(0)
-            tvLog.text = ""
-            getSharedPreferences("vitranslate", MODE_PRIVATE)
-                .edit().remove("conv_log").apply()
-            toast("Đã xóa nội dung hội thoại")
-        }
-
-        // Khôi phục nội dung hội thoại của các lần trước
-        val saved = getSharedPreferences("vitranslate", MODE_PRIVATE)
-            .getString("conv_log", "") ?: ""
-        if (saved.isNotEmpty()) {
-            logBuf.append(saved)
-            tvLog.text = Html.fromHtml(saved, Html.FROM_HTML_MODE_LEGACY)
-            scroll.post { scroll.fullScroll(ScrollView.FOCUS_DOWN) }
+            } else BluetoothHelper.disableHeadsetMic(this)
         }
 
         requestPermissions()
@@ -169,55 +198,36 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         if (need.isNotEmpty()) ActivityCompat.requestPermissions(this, need.toTypedArray(), 1)
     }
 
-    // ---------------- NHẬN DẠNG GIỌNG NÓI ----------------
+    // ================================================================
+    //           🎤 HAI NÚT: BẤM → GHI ÂM → DỊCH → ĐỌC TO
+    // ================================================================
 
-    /**
-     * SỬA LỖI 11/13 trên Xiaomi/HyperOS: máy gắn app vào dịch vụ nhận dạng
-     * MẶC ĐỊNH CỦA HÃNG (không hỗ trợ tiếng Việt) → lỗi 13 (ngôn ngữ không có)
-     * và 11 (mất kết nối dịch vụ). Hàm này tìm và KẾT NỐI THẲNG vào dịch vụ
-     * nhận dạng CỦA GOOGLE (app Google / Speech Services) thay vì dùng mặc định.
-     */
     private var sttEngineIdx = 0
+    private var manualRetries = 0
 
-    /**
-     * Danh sách ứng viên dịch vụ nhận dạng, xếp theo độ ưu tiên:
-     *  1. Dịch vụ ONLINE của app Google (GoogleRecognitionService) — chuẩn nhất,
-     *     hỗ trợ mọi ngôn ngữ, không cần tải gói offline
-     *  2. Các dịch vụ khác trong app Google
-     *  3. Dịch vụ mặc định của máy
-     *  4. Các dịch vụ Google khác (vd: bộ on-device của Android System Intelligence)
-     * Khi gặp lỗi 11/12/13, app XOAY sang ứng viên kế tiếp và thử lại.
-     */
+    /** Danh sách dịch vụ nhận dạng, ưu tiên dịch vụ ONLINE của app Google */
     private fun sttCandidates(): List<android.content.ComponentName?> {
         val list = mutableListOf<android.content.ComponentName?>()
         try {
             val services = packageManager.queryIntentServices(
                 Intent(android.speech.RecognitionService.SERVICE_INTERFACE), 0
             )
-            fun add(cn: android.content.ComponentName?) {
-                if (!list.contains(cn)) list.add(cn)
-            }
-            // (1) Dịch vụ online của app Google
+            fun add(cn: android.content.ComponentName?) { if (!list.contains(cn)) list.add(cn) }
             services.firstOrNull {
                 it.serviceInfo.packageName == "com.google.android.googlequicksearchbox" &&
                         it.serviceInfo.name.contains("GoogleRecognitionService")
             }?.let { add(android.content.ComponentName(it.serviceInfo.packageName, it.serviceInfo.name)) }
-            // (2) Các dịch vụ khác trong app Google
             services.filter { it.serviceInfo.packageName == "com.google.android.googlequicksearchbox" }
                 .forEach { add(android.content.ComponentName(it.serviceInfo.packageName, it.serviceInfo.name)) }
-            // (3) Mặc định của máy
-            add(null)
-            // (4) Các dịch vụ Google còn lại
+            add(null) // mặc định của máy
             services.filter { it.serviceInfo.packageName.startsWith("com.google.android") }
                 .forEach { add(android.content.ComponentName(it.serviceInfo.packageName, it.serviceInfo.name)) }
-        } catch (e: Exception) {
-            list.add(null)
-        }
+        } catch (e: Exception) { list.add(null) }
         if (list.isEmpty()) list.add(null)
         return list
     }
 
-    private fun createBestRecognizer(): SpeechRecognizer {
+    private fun createRecognizer(): SpeechRecognizer {
         val cands = sttCandidates()
         val cn = cands[sttEngineIdx % cands.size]
         return try {
@@ -228,28 +238,15 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
     }
 
-    /** Xoay sang dịch vụ nhận dạng kế tiếp (gọi khi gặp lỗi 11/12/13) */
-    private fun rotateSttEngine() {
-        sttEngineIdx = (sttEngineIdx + 1) % sttCandidates().size
+    private fun errMsg(error: Int): String = when (error) {
+        SpeechRecognizer.ERROR_NO_MATCH,
+        SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "Không nghe rõ, hãy bấm nút và nói lại"
+        SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Chưa cấp quyền micro"
+        1, 2 -> "Lỗi mạng — nhận dạng cần Internet, kiểm tra Wi-Fi/4G"
+        11 -> "Mất kết nối dịch vụ nhận dạng (lỗi 11)"
+        12, 13 -> "Thiếu gói ngôn ngữ nhận dạng (lỗi $error)"
+        else -> "Lỗi nhận dạng ($error), bấm nút thử lại"
     }
-
-    /** Diễn giải mã lỗi nhận dạng thành thông báo dễ hiểu */
-    private fun sttErrorMsg(error: Int): String = when (error) {
-        1, 2 -> "Lỗi mạng khi nhận dạng — kiểm tra Internet rồi thử lại"
-        3 -> "Lỗi micro — kiểm tra quyền micro / tai nghe"
-        4, 11 -> "Dịch vụ nhận dạng bị ngắt (lỗi $error) — đang thử lại…"
-        5 -> "Lỗi trình nhận dạng (5) — thử lại"
-        8 -> "Trình nhận dạng đang bận (8) — đang thử lại…"
-        9 -> "Chưa cấp quyền micro"
-        10 -> "Quá nhiều yêu cầu (10) — chờ chút rồi thử lại"
-        12, 13 -> "Ngôn ngữ chưa có trong dịch vụ nhận dạng (lỗi $error). " +
-                "Hãy mở Play Store cập nhật app Google, rồi vào Cài đặt > " +
-                "Quản lý ứng dụng > Google > bật, và thử lại."
-        else -> "Lỗi nhận dạng ($error), thử lại"
-    }
-
-    /** Cho phép tự thử lại tối đa 2 lần (xoay engine) ở nút bấm thủ công */
-    private var manualRetries = 0
 
     private fun startListening(viToForeign: Boolean, isRetry: Boolean = false) {
         if (!SpeechRecognizer.isRecognitionAvailable(this)) {
@@ -257,66 +254,54 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             return
         }
         if (!isRetry) manualRetries = 0
+
         recognizer?.destroy()
-        recognizer = createBestRecognizer()
+        recognizer = createRecognizer()
 
         val sttLang = if (viToForeign) "vi-VN" else selected.stt
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(
-                RecognizerIntent.EXTRA_LANGUAGE_MODEL,
-                RecognizerIntent.LANGUAGE_MODEL_FREE_FORM
-            )
+            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL,
+                RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, sttLang)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, sttLang)
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-            // Chốt câu nhanh: im lặng 1 giây coi như nói xong → dịch ngay
-            // (mặc định hệ thống chờ ~2 giây, làm phản hồi chậm hẳn)
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1000)
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1000)
-            // QUAN TRỌNG (sửa lỗi 13): ÉP nhận dạng ONLINE — Android 13+
-            // mặc định ưu tiên bộ on-device vốn đòi tải gói ngôn ngữ riêng
+            // Ép nhận dạng ONLINE (tránh lỗi 13 thiếu gói offline trên Android 13+)
             putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, false)
             putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
         }
 
-        tvStatus.text = getString(R.string.listening) +
-                if (viToForeign) " (Tiếng Việt)" else " (${selected.label})"
+        tvStatus.text = "🎙 Đang ghi âm… " +
+                if (viToForeign) "(nói TIẾNG VIỆT)" else "(${selected.label})"
 
         recognizer?.setRecognitionListener(object : RecognitionListener {
             override fun onResults(results: Bundle) {
                 val text = results
                     .getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                    ?.firstOrNull() ?: return
-                tvStatus.text = "Đã nghe xong, đang dịch…"
+                    ?.firstOrNull()
+                if (text.isNullOrBlank()) {
+                    tvStatus.text = "Không nghe thấy gì, bấm nút nói lại"
+                    return
+                }
+                tvStatus.text = "Đang dịch…"
                 handleRecognized(text, viToForeign)
             }
 
             override fun onPartialResults(partial: Bundle) {
-                val text = partial
-                    .getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                val t = partial.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                     ?.firstOrNull()
-                if (!text.isNullOrBlank()) tvStatus.text = "🎙 $text"
+                if (!t.isNullOrBlank()) tvStatus.text = "🎙 $t"
             }
 
             override fun onError(error: Int) {
-                when (error) {
-                    SpeechRecognizer.ERROR_NO_MATCH,
-                    SpeechRecognizer.ERROR_SPEECH_TIMEOUT ->
-                        tvStatus.text = "Không nghe rõ, hãy thử lại"
-                    // Lỗi dịch vụ (bận/ngắt/thiếu ngôn ngữ): XOAY sang dịch vụ
-                    // nhận dạng kế tiếp rồi tự thử lại, tối đa 2 lần
-                    4, 5, 8, 11, 12, 13 -> {
-                        if (manualRetries < 2) {
-                            manualRetries++
-                            rotateSttEngine()
-                            tvStatus.text = "Đang đổi bộ nhận dạng (lỗi $error), nghe lại…"
-                            ui.postDelayed({ startListening(viToForeign, isRetry = true) }, 500)
-                        } else {
-                            tvStatus.text = sttErrorMsg(error)
-                        }
-                    }
-                    else -> tvStatus.text = sttErrorMsg(error)
+                // Lỗi dịch vụ: xoay sang bộ nhận dạng kế tiếp, tự thử lại tối đa 2 lần
+                if (error in intArrayOf(4, 5, 8, 11, 12, 13) && manualRetries < 2) {
+                    manualRetries++
+                    sttEngineIdx = (sttEngineIdx + 1) % sttCandidates().size
+                    tvStatus.text = "Đang đổi bộ nhận dạng (lỗi $error), nghe lại — hãy nói…"
+                    ui.postDelayed({ startListening(viToForeign, isRetry = true) }, 500)
+                    return
                 }
+                tvStatus.text = errMsg(error)
             }
 
             override fun onReadyForSpeech(params: Bundle?) {}
@@ -329,43 +314,15 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         recognizer?.startListening(intent)
     }
 
-    /** Đếm lượt của chế độ tự động — dùng cho bộ giám sát chống treo */
-    private var autoTurnId = 0
-
     /**
-     * Xử lý câu vừa nghe được:
-     * 1. HIỆN NGAY câu gốc vào ô hội thoại (để luôn kiểm tra được máy nghe gì).
-     * 2. ML Kit Language ID tự phát hiện ngôn ngữ thật của câu.
-     * 3. Dịch: tiếng Việt → ngoại ngữ, ngoại ngữ → tiếng Việt.
-     * 4. Hiện cặp câu (gốc + dịch) và ĐỌC TO bản dịch.
-     * 5. Bộ giám sát 15 giây: nếu dịch bị treo (mạng chậm, đang tải mô hình)
-     *    thì báo lỗi vào ô hội thoại và cho vòng lặp tự động chạy tiếp,
-     *    không bao giờ đứng im.
+     * Câu nghe được → tự phát hiện ngôn ngữ (ML Kit) → dịch đúng chiều
+     * → hiện 2 dòng (gốc + dịch) → đọc to bản dịch.
      */
     private fun handleRecognized(text: String, viToForeignPressed: Boolean) {
-        // (1) Hiện ngay câu nghe được — chưa cần biết dịch có thành công không
-        appendSystemLog("🎙 Nghe được: \"$text\" — đang dịch…")
-
-        // (5) Bộ giám sát chống treo cho chế độ tự động
-        val myTurn = ++autoTurnId
-        var turnDone = false
-        if (autoMode) {
-            ui.postDelayed({
-                if (autoMode && myTurn == autoTurnId && !turnDone) {
-                    turnDone = true
-                    appendSystemLog("⚠️ Dịch/đọc quá lâu — tự chuyển lượt và nghe tiếp…")
-                    // Chuyển lượt cho người kia (không kẹt mãi một thứ tiếng)
-                    autoListenVi = !autoListenVi
-                    beep()
-                    autoListenLoop()
-                }
-            }, 15000)
-        }
-
         TranslateHelper.identifyLanguage(text) { detected ->
             val isVietnamese = when (detected) {
                 "vi" -> true
-                "und" -> viToForeignPressed // không rõ → tin theo nút/lượt hiện tại
+                "und" -> viToForeignPressed
                 else -> false
             }
             val src = if (isVietnamese) "vi" else selected.mlkit
@@ -374,32 +331,10 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             TranslateHelper.translate(text, src, dst,
                 onResult = { translated ->
                     runOnUiThread {
-                        if (turnDone) return@runOnUiThread // giám sát đã cho chạy tiếp rồi
-                        appendLog(
-                            speakerVi = isVietnamese,
-                            original = text,
-                            translated = translated
-                        )
+                        appendLog(isVietnamese, text, translated)
                         tvStatus.text = "Sẵn sàng"
-                        if (!ttsReady && autoMode) {
-                            appendSystemLog("⚠️ Giọng đọc (TTS) chưa sẵn sàng — chỉ hiện chữ, chưa phát tiếng được")
-                        }
-                        if (switchSpeak.isChecked || autoMode) {
-                            speak(translated, if (isVietnamese) selected.tts else Locale("vi", "VN")) {
-                                // Đọc xong bản dịch → nếu đang ở chế độ tự động thì
-                                // BÍP báo lượt và chuyển sang nghe NGƯỜI KIA
-                                if (autoMode && !turnDone) {
-                                    turnDone = true
-                                    autoListenVi = !isVietnamese
-                                    beep()
-                                    ui.postDelayed({ autoListenLoop() }, 350)
-                                }
-                            }
-                        } else if (autoMode && !turnDone) {
-                            turnDone = true
-                            autoListenVi = !isVietnamese
-                            beep()
-                            ui.postDelayed({ autoListenLoop() }, 350)
+                        if (switchSpeak.isChecked) {
+                            speak(translated, if (isVietnamese) selected.tts else Locale("vi", "VN"))
                         }
                     }
                 },
@@ -407,235 +342,261 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                     runOnUiThread {
                         tvStatus.text = err
                         appendSystemLog("❌ $err")
-                        if (autoMode && !turnDone) {
-                            turnDone = true
-                            ui.postDelayed({ autoListenLoop() }, 800)
-                        }
                     }
                 }
             )
         }
     }
 
-    /* ================================================================
-       🔁 HỘI THOẠI TỰ ĐỘNG (RẢNH TAY) — kiểu tai nghe phiên dịch:
-       Dùng loa ngoài (đặt điện thoại giữa 2 người) HOẶC tai nghe
-       Bluetooth (bật công tắc Bluetooth, mỗi người đeo 1 bên tai).
+    // ================================================================
+    //        🎵 DỊCH FILE GHI ÂM (nhận dạng offline bằng Vosk)
+    // ================================================================
 
-       Cách hoạt động — vòng lặp "ping-pong":
-       1. Chọn thứ tiếng bắt đầu (Việt hoặc ngoại ngữ) khi bấm nút.
-       2. Nghe → nhận câu → hiện CẢ 2 DÒNG (câu gốc + bản dịch) →
-          ĐỌC TO bản dịch cho người kia nghe.
-       3. Đọc xong: BÍP một tiếng + tự chuyển sang nghe thứ tiếng còn lại.
-       4. Không ai nói trong lượt → bíp + tự đảo lượt nghe.
-       5. ML Kit Language ID kiểm lại từng câu: nói "trái lượt" vẫn dịch đúng.
+    private var fileLangCode = "en" // ngôn ngữ trong file đang xử lý
 
-       Kỹ thuật ổn định (sửa lỗi "không nhận được giọng nói"):
-       - Dùng MỘT SpeechRecognizer duy nhất cho cả phiên, không hủy/tạo lại
-         liên tục (tạo lại mỗi vòng gây lỗi ERROR_BUSY/CLIENT trên nhiều máy
-         → máy im lặng không nghe gì).
-       - Gặp lỗi BUSY/CLIENT: cancel() rồi nghe lại; lỗi 4 lần liên tiếp
-         mới hủy tạo recognizer mới.
-       ================================================================ */
+    private val filePicker =
+        registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+            if (uri != null) processAudioFile(uri, fileLangCode)
+        }
 
-    private var autoMode = false
-    private var autoListenVi = true // lượt hiện tại: true = đang chờ tiếng Việt
-    private var autoRec: SpeechRecognizer? = null
-    private var autoErrStreak = 0
-    private var silentCount = 0 // số lần im lặng liên tiếp trong một lượt
-    private val ui = android.os.Handler(android.os.Looper.getMainLooper())
-    private var beeper: android.media.ToneGenerator? = null
-
-    /** Hỏi thứ tiếng bắt đầu rồi mới chạy hội thoại tự động */
-    private fun chooseStartLanguage() {
-        androidx.appcompat.app.AlertDialog.Builder(this)
-            .setTitle("Bắt đầu nghe thứ tiếng nào trước?")
-            .setItems(arrayOf("🟢 Tiếng Việt nói trước", "🔴 ${selected.label} nói trước")) { _, which ->
-                startAutoMode(startWithVi = which == 0)
+    /** Bước 1: hỏi file ghi âm là tiếng gì → đảm bảo có mô hình → mở chọn file */
+    private fun pickFileFlow() {
+        val options = arrayOf("🟢 Tiếng Việt", "🔴 ${selected.label}")
+        AlertDialog.Builder(this)
+            .setTitle("File ghi âm là tiếng gì?")
+            .setItems(options) { _, which ->
+                val code = if (which == 0) "vi" else selected.mlkit
+                if (!voskModels.containsKey(code)) {
+                    toast("Chưa hỗ trợ nhận dạng file cho ${selected.label}")
+                    return@setItems
+                }
+                fileLangCode = code
+                ensureVoskModel(code) { filePicker.launch("audio/*") }
             }
             .show()
     }
 
-    private fun startAutoMode(startWithVi: Boolean) {
-        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-            toast("Máy chưa có dịch vụ nhận dạng giọng nói (cần app Google)")
-            return
-        }
-        // Dừng nghe thủ công nếu đang chạy, tránh tranh chấp micro
-        recognizer?.destroy(); recognizer = null
+    private fun modelDir(code: String) = File(filesDir, "models/${voskModels[code]}")
 
-        autoMode = true
-        autoListenVi = startWithVi
-        autoErrStreak = 0
-        silentCount = 0
-        beeper = try {
-            android.media.ToneGenerator(android.media.AudioManager.STREAM_MUSIC, 85)
-        } catch (e: Exception) { null }
-
-        autoRec = createBestRecognizer() // kết nối thẳng dịch vụ Google (sửa lỗi 11/13)
-        autoRec?.setRecognitionListener(autoListener)
-
-        findViewById<Button>(R.id.btnAuto).text = "⏹ Dừng hội thoại tự động"
-        appendSystemLog(
-            "🔁 Hội thoại tự động: Việt ↔ ${selected.label}. " +
-            "Nghe ${if (startWithVi) "TIẾNG VIỆT" else selected.label} trước. " +
-            "Sau mỗi tiếng BÍP là đến lượt người kia nói."
-        )
-        // Tải sẵn mô hình dịch CẢ 2 CHIỀU ngay từ đầu (lần đầu ~30MB/chiều),
-        // để câu đầu tiên không bị treo chờ tải
-        appendSystemLog("⏬ Đang chuẩn bị mô hình dịch 2 chiều (lần đầu có thể mất 1–2 phút, cần mạng)…")
-        TranslateHelper.translate("xin chào", "vi", selected.mlkit,
-            onResult = { runOnUiThread { appendSystemLog("✅ Sẵn sàng dịch Việt → ${selected.label}") } },
-            onError = { e -> runOnUiThread { appendSystemLog("❌ $e") } })
-        TranslateHelper.translate("hello", selected.mlkit, "vi",
-            onResult = { runOnUiThread { appendSystemLog("✅ Sẵn sàng dịch ${selected.label} → Việt") } },
-            onError = { e -> runOnUiThread { appendSystemLog("❌ $e") } })
-        autoListenLoop()
+    /** Bước 2: mô hình chưa có thì hỏi tải (~40–70MB, 1 lần) rồi chạy tiếp */
+    private fun ensureVoskModel(code: String, onReady: () -> Unit) {
+        if (modelDir(code).exists()) { onReady(); return }
+        AlertDialog.Builder(this)
+            .setTitle("Cần tải mô hình nhận dạng")
+            .setMessage("Lần đầu dịch file ghi âm ngôn ngữ này cần tải mô hình (~40–70MB). Tải ngay?")
+            .setPositiveButton("Tải") { _, _ -> downloadVoskModel(code, onReady) }
+            .setNegativeButton("Hủy", null)
+            .show()
     }
 
-    private fun stopAutoMode() {
-        if (!autoMode) return
-        autoMode = false
-        ui.removeCallbacksAndMessages(null)
-        autoRec?.destroy(); autoRec = null
-        beeper?.release(); beeper = null
-        tts?.stop()
-        findViewById<Button>(R.id.btnAuto).text =
-            "🔁 Hội thoại tự động (rảnh tay — mỗi người 1 tai nghe)"
-        tvStatus.text = "Đã dừng hội thoại tự động"
-    }
-
-    /** Bíp ngắn báo "đến lượt nói" */
-    private fun beep() {
-        beeper?.startTone(android.media.ToneGenerator.TONE_PROP_BEEP, 130)
-    }
-
-    /** Listener dùng chung cho mọi vòng nghe của chế độ tự động */
-    private val autoListener = object : RecognitionListener {
-        override fun onResults(results: Bundle) {
-            if (!autoMode) return
-            autoErrStreak = 0
-            silentCount = 0
-            val text = results
-                .getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                ?.firstOrNull()
-            if (text.isNullOrBlank()) {
-                ui.postDelayed({ autoListenLoop() }, 250)
-                return
-            }
-            tvStatus.text = "Đang dịch…"
-            // handleRecognized hiện 2 dòng (gốc + dịch), đọc to bản dịch,
-            // rồi tự gọi lại autoListenLoop cho lượt tiếp theo
-            handleRecognized(text, autoListenVi)
-        }
-
-        override fun onPartialResults(partial: Bundle) {
-            val t = partial.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                ?.firstOrNull()
-            if (!t.isNullOrBlank()) tvStatus.text = "🎙 $t"
-        }
-
-        override fun onError(error: Int) {
-            if (!autoMode) return
-            when (error) {
-                SpeechRecognizer.ERROR_NO_MATCH,
-                SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> {
-                    // Không ai nói ở lượt này. Chờ đủ 2 lần im lặng liên tiếp
-                    // (~10 giây) mới đảo lượt — để người nói có thời gian
-                    // suy nghĩ/mở lời, không bị "cướp lượt" giữa chừng
-                    autoErrStreak = 0
-                    silentCount++
-                    if (silentCount >= 2) {
-                        silentCount = 0
-                        autoListenVi = !autoListenVi
-                        beep()
+    private fun downloadVoskModel(code: String, onReady: () -> Unit) {
+        val name = voskModels[code] ?: return
+        appendSystemLog("⏬ Đang tải mô hình nhận dạng $name…")
+        thread {
+            try {
+                val zipFile = File(cacheDir, "$name.zip")
+                val conn = URL("https://alphacephei.com/vosk/models/$name.zip")
+                    .openConnection() as HttpURLConnection
+                conn.connectTimeout = 15000
+                conn.inputStream.use { inp ->
+                    FileOutputStream(zipFile).use { out -> inp.copyTo(out, 64 * 1024) }
+                }
+                val outRoot = File(filesDir, "models").apply { mkdirs() }
+                ZipInputStream(zipFile.inputStream().buffered()).use { zis ->
+                    var e = zis.nextEntry
+                    while (e != null) {
+                        val f = File(outRoot, e.name)
+                        if (f.canonicalPath.startsWith(outRoot.canonicalPath)) {
+                            if (e.isDirectory) f.mkdirs()
+                            else { f.parentFile?.mkdirs(); FileOutputStream(f).use { zis.copyTo(it) } }
+                        }
+                        e = zis.nextEntry
                     }
-                    ui.postDelayed({ autoListenLoop() }, 350)
                 }
-                SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {
-                    tvStatus.text = "Chưa cấp quyền micro"
-                    stopAutoMode()
+                zipFile.delete()
+                runOnUiThread {
+                    appendSystemLog("✅ Đã tải xong mô hình. Hãy chọn file ghi âm.")
+                    onReady()
                 }
-                4, 11, 12, 13 -> {
-                    // Dịch vụ nhận dạng lỗi / thiếu ngôn ngữ → XOAY sang dịch vụ
-                    // kế tiếp trong danh sách rồi thử lại; hết danh sách vẫn lỗi
-                    // (thử tối đa 4 lần) thì báo hướng dẫn và dừng
-                    autoErrStreak++
-                    if (autoErrStreak <= 4) {
-                        rotateSttEngine()
-                        appendSystemLog("🔄 Lỗi $error — đổi bộ nhận dạng, thử lại (${autoErrStreak}/4)…")
-                        autoRec?.destroy()
-                        autoRec = createBestRecognizer()
-                        autoRec?.setRecognitionListener(this)
-                        ui.postDelayed({ autoListenLoop() }, 600)
+            } catch (e: Exception) {
+                runOnUiThread { appendSystemLog("❌ Lỗi tải mô hình: ${e.message}") }
+            }
+        }
+    }
+
+    /** Bước 3: giải mã file → Vosk nhận dạng → dịch từng đoạn → hiện + đọc to */
+    private fun processAudioFile(uri: Uri, langCode: String) {
+        appendSystemLog("🎵 Đang xử lý file ghi âm (${if (langCode == "vi") "Tiếng Việt" else selected.label})…")
+        tvStatus.text = "Đang nhận dạng file ghi âm…"
+        thread {
+            try {
+                val pcm = decodeToPcm16Mono16k(uri)
+                if (pcm.isEmpty()) throw Exception("File không có âm thanh đọc được")
+
+                val model = Model(modelDir(langCode).absolutePath)
+                val rec = Recognizer(model, 16000f)
+                val segments = mutableListOf<String>()
+
+                var i = 0
+                val chunk = ByteArray(8000) // 0,25 giây mỗi lần
+                while (i < pcm.size) {
+                    val n = minOf(chunk.size, pcm.size - i)
+                    System.arraycopy(pcm, i, chunk, 0, n)
+                    if (rec.acceptWaveForm(chunk, n)) {
+                        val t = JSONObject(rec.result).optString("text")
+                        if (t.isNotBlank()) segments.add(t)
+                    }
+                    i += n
+                }
+                JSONObject(rec.finalResult).optString("text")
+                    .takeIf { it.isNotBlank() }?.let { segments.add(it) }
+                rec.close(); model.close()
+
+                if (segments.isEmpty()) {
+                    runOnUiThread {
+                        appendSystemLog("⚠️ Không nhận dạng được lời nói nào trong file")
+                        tvStatus.text = "Sẵn sàng"
+                    }
+                    return@thread
+                }
+
+                // Dịch từng đoạn, hiện cặp câu; đọc to toàn bộ bản dịch khi xong
+                val src = langCode
+                val dst = if (langCode == "vi") selected.mlkit else "vi"
+                val translatedAll = StringBuilder()
+                var done = 0
+                for (seg in segments) {
+                    TranslateHelper.translate(seg, src, dst,
+                        onResult = { tr ->
+                            runOnUiThread {
+                                appendLog(langCode == "vi", seg, tr)
+                                translatedAll.append(tr).append(". ")
+                                if (++done == segments.size) {
+                                    tvStatus.text = "Sẵn sàng"
+                                    if (switchSpeak.isChecked) {
+                                        val loc = if (langCode == "vi") selected.tts
+                                                  else Locale("vi", "VN")
+                                        speak(translatedAll.toString(), loc)
+                                    }
+                                }
+                            }
+                        },
+                        onError = { err ->
+                            runOnUiThread {
+                                appendSystemLog("❌ $err")
+                                if (++done == segments.size) tvStatus.text = "Sẵn sàng"
+                            }
+                        })
+                }
+            } catch (e: Exception) {
+                runOnUiThread {
+                    appendSystemLog("❌ Lỗi xử lý file: ${e.message}")
+                    tvStatus.text = "Sẵn sàng"
+                }
+            }
+        }
+    }
+
+    /**
+     * Giải mã file âm thanh bất kỳ (mp3/m4a/wav/amr/ogg…) thành PCM 16-bit
+     * mono 16kHz cho Vosk, dùng MediaExtractor + MediaCodec của Android.
+     */
+    private fun decodeToPcm16Mono16k(uri: Uri): ByteArray {
+        val extractor = MediaExtractor()
+        extractor.setDataSource(this, uri, null)
+        var trackIdx = -1
+        var format: MediaFormat? = null
+        for (t in 0 until extractor.trackCount) {
+            val f = extractor.getTrackFormat(t)
+            if (f.getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true) {
+                trackIdx = t; format = f; break
+            }
+        }
+        if (trackIdx < 0 || format == null) throw Exception("Không tìm thấy luồng âm thanh")
+        extractor.selectTrack(trackIdx)
+
+        val mime = format.getString(MediaFormat.KEY_MIME)!!
+        val codec = MediaCodec.createDecoderByType(mime)
+        codec.configure(format, null, null, 0)
+        codec.start()
+
+        val out = ByteArrayOutputStream()
+        var srcRate = format.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+        var channels = format.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+        val info = MediaCodec.BufferInfo()
+        var inputDone = false
+        var outputDone = false
+
+        while (!outputDone) {
+            if (!inputDone) {
+                val inIdx = codec.dequeueInputBuffer(10000)
+                if (inIdx >= 0) {
+                    val buf = codec.getInputBuffer(inIdx)!!
+                    val n = extractor.readSampleData(buf, 0)
+                    if (n < 0) {
+                        codec.queueInputBuffer(inIdx, 0, 0, 0,
+                            MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                        inputDone = true
                     } else {
-                        appendSystemLog("❌ " + sttErrorMsg(error))
-                        tvStatus.text = sttErrorMsg(error)
-                        stopAutoMode()
+                        codec.queueInputBuffer(inIdx, 0, n, extractor.sampleTime, 0)
+                        extractor.advance()
                     }
                 }
-                else -> {
-                    // BUSY / CLIENT / AUDIO…: KHÔNG đảo lượt, thử nghe lại.
-                    // Lỗi 4 lần liên tiếp → tạo recognizer mới cho chắc.
-                    autoErrStreak++
-                    try { autoRec?.cancel() } catch (e: Exception) {}
-                    if (autoErrStreak >= 4) {
-                        autoErrStreak = 0
-                        autoRec?.destroy()
-                        autoRec = createBestRecognizer()
-                        autoRec?.setRecognitionListener(this)
-                    }
-                    ui.postDelayed({ autoListenLoop() }, 500)
+            }
+            val outIdx = codec.dequeueOutputBuffer(info, 10000)
+            when {
+                outIdx >= 0 -> {
+                    val buf = codec.getOutputBuffer(outIdx)!!
+                    val bytes = ByteArray(info.size)
+                    buf.get(bytes); buf.clear()
+                    out.write(bytes)
+                    codec.releaseOutputBuffer(outIdx, false)
+                    if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) outputDone = true
+                }
+                outIdx == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                    val nf = codec.outputFormat
+                    srcRate = nf.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                    channels = nf.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
                 }
             }
         }
+        codec.stop(); codec.release(); extractor.release()
 
-        override fun onReadyForSpeech(params: Bundle?) {}
-        override fun onBeginningOfSpeech() {}
-        override fun onRmsChanged(rmsdB: Float) {}
-        override fun onBufferReceived(buffer: ByteArray?) {}
-        override fun onEndOfSpeech() { tvStatus.text = "Đang xử lý…" }
-        override fun onEvent(eventType: Int, params: Bundle?) {}
+        // PCM16 nhiều kênh / tần số khác → mono 16kHz (trộn kênh + nội suy tuyến tính)
+        val raw = out.toByteArray()
+        val totalSamples = raw.size / 2
+        val frames = totalSamples / channels
+        val mono = ShortArray(frames)
+        for (f in 0 until frames) {
+            var sum = 0
+            for (c in 0 until channels) {
+                val idx = (f * channels + c) * 2
+                sum += ((raw[idx + 1].toInt() shl 8) or (raw[idx].toInt() and 0xFF)).toShort().toInt()
+            }
+            mono[f] = (sum / channels).toShort()
+        }
+        val outFrames = (frames.toLong() * 16000 / srcRate).toInt()
+        val res = ByteArray(outFrames * 2)
+        for (f in 0 until outFrames) {
+            val pos = f.toLong() * srcRate / 16000
+            val p0 = pos.toInt().coerceAtMost(frames - 1)
+            val p1 = (p0 + 1).coerceAtMost(frames - 1)
+            val frac = (f.toLong() * srcRate % 16000).toFloat() / 16000f
+            val s = (mono[p0] * (1 - frac) + mono[p1] * frac).toInt()
+            res[f * 2] = (s and 0xFF).toByte()
+            res[f * 2 + 1] = ((s shr 8) and 0xFF).toByte()
+        }
+        return res
     }
 
-    /** Một vòng nghe của chế độ tự động (dùng lại recognizer, không tạo mới) */
-    private fun autoListenLoop() {
-        if (!autoMode) return
-        val rec = autoRec ?: return
+    // ================================================================
+    //                    Ô HỘI THOẠI (lưu vĩnh viễn)
+    // ================================================================
 
-        val sttLang = if (autoListenVi) "vi-VN" else selected.stt
-        val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL,
-                RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE, sttLang)
-            putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, sttLang)
-            putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-            // Ngắt câu nhanh hơn: im lặng 1 giây coi như nói xong → dịch ngay
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1000)
-            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1000)
-            // QUAN TRỌNG (sửa lỗi 13): ÉP nhận dạng ONLINE
-            putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, false)
-            putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
-        }
-
-        tvStatus.text = if (autoListenVi)
-            "🟢 MỜI NÓI TIẾNG VIỆT…"
-        else
-            "🔴 ${selected.label} — SPEAK NOW…"
-
-        try {
-            rec.startListening(intent)
-        } catch (e: Exception) {
-            ui.postDelayed({ autoListenLoop() }, 600)
-        }
-    }
-
-    /** Toàn bộ nội dung hội thoại (HTML) — lưu bền, chỉ mất khi bấm 🗑 Xóa */
     private val logBuf = StringBuilder()
 
     private fun persistLog(html: String) {
         logBuf.append(html)
-        // Giới hạn 200KB để không phình vô hạn (cắt bớt phần cũ nhất)
         if (logBuf.length > 200_000) logBuf.delete(0, logBuf.length - 150_000)
         getSharedPreferences("vitranslate", MODE_PRIVATE)
             .edit().putString("conv_log", logBuf.toString()).apply()
@@ -656,29 +617,22 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         scroll.post { scroll.fullScroll(ScrollView.FOCUS_DOWN) }
     }
 
-    // ---------------- ĐỌC TO (TTS) ----------------
-
-    private var triedDefaultEngine = false
+    // ================================================================
+    //                        ĐỌC TO (TTS)
+    // ================================================================
 
     override fun onInit(status: Int) {
         ttsReady = status == TextToSpeech.SUCCESS
         if (!ttsReady) {
             if (!triedDefaultEngine) {
-                // Google TTS không có / bị tắt → thử engine mặc định của máy
                 triedDefaultEngine = true
                 tts = TextToSpeech(this, this)
             } else {
                 toast("Không khởi động được Text-to-Speech. Hãy cài 'Speech Services by Google' từ Play Store.")
             }
-        } else if (autoMode) {
-            appendSystemLog("🔊 Giọng đọc đã sẵn sàng trở lại")
         }
     }
 
-    /** Callback chờ TTS đọc xong (dùng cho chế độ hội thoại tự động) */
-    private var pendingTtsDone: (() -> Unit)? = null
-
-    /** Khởi động lại TTS từ đầu khi phát hiện hỏng giữa chừng */
     private fun reinitTts() {
         ttsReady = false
         triedDefaultEngine = false
@@ -690,12 +644,10 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         }
     }
 
-    private fun speak(text: String, locale: Locale, onDone: (() -> Unit)? = null) {
+    private fun speak(text: String, locale: Locale) {
         if (!ttsReady) {
-            // Không im lặng bỏ qua nữa — báo rõ và tự khởi động lại giọng đọc
             appendSystemLog("⚠️ Giọng đọc chưa sẵn sàng — đang khởi động lại, câu sau sẽ có tiếng…")
             reinitTts()
-            onDone?.invoke()
             return
         }
         val res = tts?.setLanguage(locale)
@@ -705,57 +657,22 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 "Cài 'Speech Services by Google' từ Play Store rồi vào Cài đặt > " +
                 "Chuyển văn bản thành giọng nói > chọn Google."
             )
-            onDone?.invoke()
             return
         }
-        // Gắn bộ báo "đọc xong" MỖI LẦN đọc (engine có thể đã bị thay)
-        tts?.setOnUtteranceProgressListener(object :
-            android.speech.tts.UtteranceProgressListener() {
-            override fun onStart(id: String?) {}
-            override fun onDone(id: String?) {
-                runOnUiThread { pendingTtsDone?.invoke(); pendingTtsDone = null }
-            }
-            @Deprecated("Deprecated in Java")
-            override fun onError(id: String?) {
-                runOnUiThread { pendingTtsDone?.invoke(); pendingTtsDone = null }
-            }
-        })
-        pendingTtsDone = onDone
-
-        // Đọc ở âm lượng tối đa của kênh media
         val params = android.os.Bundle().apply {
             putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f)
         }
         val rc = tts?.speak(text, TextToSpeech.QUEUE_FLUSH, params, "vt_${System.nanoTime()}")
             ?: TextToSpeech.ERROR
-
-        // KIỂM TRA MÃ TRẢ VỀ: engine chết ngầm sẽ trả ERROR mà không báo gì —
-        // đây là lý do "không dịch thành tiếng" mà app vẫn chạy bình thường
         if (rc != TextToSpeech.SUCCESS) {
             appendSystemLog("❌ Giọng đọc bị lỗi (mã $rc) — đang khởi động lại, câu sau sẽ có tiếng…")
-            pendingTtsDone = null
             reinitTts()
-            onDone?.invoke()
-            return
-        }
-
-        // LƯỚI AN TOÀN: engine không phát tín hiệu "đọc xong" → tự hoàn tất
-        // sau thời lượng ước tính, vòng lặp tự động không bao giờ kẹt
-        if (onDone != null) {
-            val estMs = (text.length * 90L + 2000L).coerceAtMost(15000L)
-            ui.postDelayed({
-                if (pendingTtsDone === onDone) {
-                    pendingTtsDone = null
-                    onDone.invoke()
-                }
-            }, estMs)
         }
     }
 
     private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
 
     override fun onDestroy() {
-        stopAutoMode()
         recognizer?.destroy()
         tts?.shutdown()
         BluetoothHelper.disableHeadsetMic(this)
