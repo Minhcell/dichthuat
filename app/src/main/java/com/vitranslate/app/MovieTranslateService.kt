@@ -81,8 +81,8 @@ class MovieTranslateService : Service() {
     // Các câu dịch xong TRƯỚC khi TTS khởi động kịp → giữ lại đọc sau
     private val earlyQueue = ArrayDeque<String>()
 
-    // ----- Hàng đợi phụ đề (hiện chậm, đọc kịp) -----
-    private val subQueue = ArrayDeque<String>()
+    // ----- Hàng đợi phụ đề song ngữ (hiện chậm, đọc kịp) -----
+    private val subQueue = ArrayDeque<SubPair>()
     private var subShowing = false
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -131,34 +131,51 @@ class MovieTranslateService : Service() {
         }
     }
 
-    private fun initTts() {
-        // Ưu tiên Google TTS (có giọng tiếng Việt chuẩn). Máy Xiaomi hay đặt
-        // engine TTS mặc định của hãng — engine đó KHÔNG có tiếng Việt
-        // nên app sẽ im lặng. Nếu máy không có Google TTS thì dùng engine mặc định.
+    /**
+     * Khởi động TTS với CHUỖI DỰ PHÒNG:
+     *  1. Thử Google TTS (com.google.android.tts — có giọng Việt chuẩn)
+     *  2. Google lỗi hoặc không có giọng Việt → thử engine MẶC ĐỊNH của máy
+     *  3. Cả hai đều không được → hướng dẫn cài Google TTS
+     * (Trước đây nếu gắn cứng engine Google mà máy chưa cài/bị tắt thì
+     *  init trả về ERROR ngay → báo "Không khởi động được Text-to-Speech")
+     */
+    private fun initTts(tryGoogleFirst: Boolean = true) {
         val googleEngine = "com.google.android.tts"
-        val hasGoogle = try {
-            packageManager.getPackageInfo(googleEngine, 0); true
-        } catch (e: Exception) { false }
 
         val listener = TextToSpeech.OnInitListener { status ->
             if (status != TextToSpeech.SUCCESS) {
-                notifyUser("❌ Không khởi động được Text-to-Speech")
+                if (tryGoogleFirst) {
+                    // Google TTS không có / bị tắt → dùng engine mặc định của máy
+                    initTts(tryGoogleFirst = false)
+                } else {
+                    notifyUser(
+                        "❌ Không khởi động được Text-to-Speech.\n" +
+                        "Hãy cài app 'Google Text-to-Speech' (hoặc 'Speech Services by Google') " +
+                        "từ Play Store rồi thử lại."
+                    )
+                }
                 return@OnInitListener
             }
             val res = tts?.setLanguage(Locale("vi", "VN"))
             if (res == TextToSpeech.LANG_MISSING_DATA || res == TextToSpeech.LANG_NOT_SUPPORTED) {
-                notifyUser(
-                    "❌ Máy chưa có giọng đọc tiếng Việt.\n" +
-                    "Cài app 'Google Text-to-Speech' từ Play Store, rồi vào " +
-                    "Cài đặt > Hệ thống > Chuyển văn bản thành giọng nói > chọn Google."
-                )
+                if (tryGoogleFirst) {
+                    // Engine Google chạy nhưng thiếu giọng Việt (hiếm) → thử engine mặc định
+                    tts?.shutdown()
+                    initTts(tryGoogleFirst = false)
+                } else {
+                    notifyUser(
+                        "❌ Máy chưa có giọng đọc tiếng Việt.\n" +
+                        "Cài 'Speech Services by Google' từ Play Store, mở app đó tải giọng " +
+                        "tiếng Việt, rồi vào Cài đặt > Trợ năng > Chuyển văn bản thành " +
+                        "giọng nói > chọn Google."
+                    )
+                }
                 return@OnInitListener
             }
             tts?.setSpeechRate(1.1f) // đọc nhanh hơn một chút để theo kịp phim
 
-            // Dùng kênh MEDIA bình thường: chắc chắn phát ra loa hoặc tai nghe
-            // Bluetooth, chỉnh âm lượng bằng nút volume như nhạc/phim.
-            // (Kênh "navigation" trước đây bị nhiều máy Xiaomi chặn/tắt tiếng.)
+            // Kênh MEDIA: chắc chắn phát ra loa hoặc tai nghe Bluetooth,
+            // chỉnh âm lượng bằng nút volume như nhạc/phim
             tts?.setAudioAttributes(
                 AudioAttributes.Builder()
                     .setUsage(AudioAttributes.USAGE_MEDIA)
@@ -195,8 +212,12 @@ class MovieTranslateService : Service() {
             }
         }
 
-        tts = if (hasGoogle) TextToSpeech(this, listener, googleEngine)
-              else TextToSpeech(this, listener)
+        tts = try {
+            if (tryGoogleFirst) TextToSpeech(this, listener, googleEngine)
+            else TextToSpeech(this, listener)
+        } catch (e: Exception) {
+            TextToSpeech(this, listener)
+        }
     }
 
     /** Hiện thông báo cho người dùng dù đang ở app khác (Toast từ service) */
@@ -249,11 +270,12 @@ class MovieTranslateService : Service() {
                 val text = JSONObject(rec.result).optString("text")
                 if (text.isNotBlank()) translateFinal(text)
             } else if (mode == MODE_SUBTITLE) {
-                // Câu đang nói dở: chỉ hiện khi không có câu nào đang chờ đọc
+                // Câu đang nói dở: chỉ hiện khi CHƯA có phụ đề nào trên màn hình
+                // (không đè mất các cặp câu song ngữ người xem đang đọc)
                 val partial = JSONObject(rec.partialResult).optString("partial")
                 if (partial.isNotBlank()) {
                     ui.post {
-                        if (!subShowing && subQueue.isEmpty()) {
+                        if (visiblePairs.isEmpty() && !subShowing && subQueue.isEmpty()) {
                             overlayView?.text = "… $partial"
                         }
                     }
@@ -266,7 +288,7 @@ class MovieTranslateService : Service() {
         TranslateHelper.translate(text, srcLang, "vi",
             onResult = { vi ->
                 if (mode == MODE_VOICE) speakVi(vi)
-                else ui.post { enqueueSubtitle(vi) }
+                else ui.post { enqueueSubtitle(text, vi) }
             },
             onError = { err ->
                 if (mode == MODE_SUBTITLE) ui.post { showOverlay(err) }
@@ -297,17 +319,24 @@ class MovieTranslateService : Service() {
         tts?.speak(text, queueMode, params, "movie_${System.nanoTime()}")
     }
 
-    // ---------------- 📖 CHẾ ĐỘ PHỤ ĐỀ (hiện chậm) ----------------
+    // ---------------- 📖 CHẾ ĐỘ PHỤ ĐỀ SONG NGỮ (cuộn chậm) ----------------
+
+    /** Một cặp phụ đề: câu gốc tiếng nước ngoài + bản dịch tiếng Việt */
+    private data class SubPair(val orig: String, val vi: String)
+
+    /** Các cặp đang hiện trên màn hình (tối đa 2 cặp = 4 dòng) */
+    private val visiblePairs = ArrayDeque<SubPair>()
 
     /**
-     * Mỗi câu phụ đề được giữ trên màn hình tối thiểu:
-     *   2,2 giây + 75ms cho mỗi ký tự (tối đa 9 giây)
-     * → câu dài hiện lâu hơn, người xem đọc kịp.
-     * Câu mới trong lúc đó được xếp hàng đợi; nếu dồn quá 3 câu
-     * (phim nói quá nhanh) thì bỏ bớt câu cũ nhất để không bị trễ.
+     * Phụ đề SONG NGỮ kiểu cuộn:
+     *  - Mỗi câu hiện 2 dòng: dòng trên là tiếng gốc (vàng), dòng dưới tiếng Việt (trắng).
+     *  - Màn hình giữ tối đa 2 cặp câu; khi câu thứ 3 xuất hiện, cặp cũ nhất
+     *    trôi lên mất — như chạy chữ chậm, luôn có câu trước đó để đọc kịp.
+     *  - Mỗi cặp mới giữ tối thiểu 1,8s + 60ms/ký tự tiếng Việt (tối đa 8s)
+     *    trước khi cặp tiếp theo được đẩy vào; dồn quá 3 cặp thì bỏ cặp cũ nhất.
      */
-    private fun enqueueSubtitle(text: String) {
-        subQueue.addLast(text)
+    private fun enqueueSubtitle(orig: String, vi: String) {
+        subQueue.addLast(SubPair(orig, vi))
         while (subQueue.size > 3) subQueue.removeFirst()
         pumpSubtitle()
     }
@@ -316,42 +345,74 @@ class MovieTranslateService : Service() {
         if (subShowing) return
         val next = subQueue.removeFirstOrNull() ?: return
         subShowing = true
-        showOverlay(next)
-        val durMs = (2200L + next.length * 75L).coerceAtMost(9000L)
+        visiblePairs.addLast(next)
+        while (visiblePairs.size > 2) visiblePairs.removeFirst() // câu cũ nhất trôi đi
+        renderPairs()
+        val durMs = (1800L + next.vi.length * 60L).coerceAtMost(8000L)
         ui.postDelayed({
             subShowing = false
             pumpSubtitle()
         }, durMs)
     }
 
-    private fun showOverlay(text: String) {
-        if (overlayView == null) {
-            windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
-            overlayView = TextView(this).apply {
-                setBackgroundColor(Color.argb(170, 0, 0, 0))
-                setTextColor(Color.WHITE)
-                textSize = 19f
-                setPadding(28, 16, 28, 16)
-            }
-            val params = WindowManager.LayoutParams(
-                WindowManager.LayoutParams.MATCH_PARENT,
-                WindowManager.LayoutParams.WRAP_CONTENT,
-                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
-                        or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
-                        or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
-                PixelFormat.TRANSLUCENT
-            ).apply {
-                gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-                y = 120
-            }
-            try {
-                windowManager?.addView(overlayView, params)
-            } catch (e: Exception) {
-                overlayView = null
-                return
-            }
+    /** Vẽ các cặp câu: tiếng gốc màu vàng, tiếng Việt màu trắng; cặp cũ mờ hơn */
+    private fun renderPairs() {
+        val sb = android.text.SpannableStringBuilder()
+        visiblePairs.forEachIndexed { i, p ->
+            val old = visiblePairs.size == 2 && i == 0
+            val cOrig = if (old) Color.argb(255, 180, 160, 80) else Color.rgb(255, 213, 79)
+            val cVi = if (old) Color.argb(255, 190, 190, 190) else Color.WHITE
+            var s = sb.length
+            sb.append(p.orig)
+            sb.setSpan(android.text.style.ForegroundColorSpan(cOrig), s, sb.length,
+                android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            sb.setSpan(android.text.style.RelativeSizeSpan(0.85f), s, sb.length,
+                android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            sb.append("\n")
+            s = sb.length
+            sb.append(p.vi)
+            sb.setSpan(android.text.style.ForegroundColorSpan(cVi), s, sb.length,
+                android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            sb.setSpan(android.text.style.StyleSpan(android.graphics.Typeface.BOLD), s, sb.length,
+                android.text.Spanned.SPAN_EXCLUSIVE_EXCLUSIVE)
+            if (i < visiblePairs.size - 1) sb.append("\n\n")
         }
+        ensureOverlay()
+        overlayView?.text = sb
+    }
+
+    /** Tạo cửa sổ phụ đề nổi nếu chưa có */
+    private fun ensureOverlay() {
+        if (overlayView != null) return
+        windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+        overlayView = TextView(this).apply {
+            setBackgroundColor(Color.argb(170, 0, 0, 0))
+            setTextColor(Color.WHITE)
+            textSize = 17f
+            setLineSpacing(4f, 1.05f)
+            setPadding(28, 16, 28, 16)
+        }
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE
+                    or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                    or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+            y = 120
+        }
+        try {
+            windowManager?.addView(overlayView, params)
+        } catch (e: Exception) {
+            overlayView = null
+        }
+    }
+
+    private fun showOverlay(text: String) {
+        ensureOverlay()
         overlayView?.text = text
     }
 
@@ -374,6 +435,7 @@ class MovieTranslateService : Service() {
         tts?.stop(); tts?.shutdown(); tts = null
         ui.post {
             subQueue.clear()
+            visiblePairs.clear()
             subShowing = false
             removeOverlay()
         }
