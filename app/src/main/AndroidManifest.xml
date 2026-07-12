@@ -14,6 +14,7 @@
 
     <!-- Android 11+: cho phép app nhìn thấy dịch vụ nhận dạng giọng nói của Google -->
     <queries>
+        <package android:name="com.google.android.tts" />
         <intent>
             <action android:name="android.speech.RecognitionService" />
         </intent>
