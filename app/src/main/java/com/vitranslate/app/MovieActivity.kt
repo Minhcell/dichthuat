@@ -25,10 +25,9 @@ import java.net.URL
 import java.util.zip.ZipInputStream
 
 /**
- * CHẾ ĐỘ DỊCH PHIM:
- * Ghi lại âm thanh đang phát trên máy (AudioPlaybackCapture, Android 10+),
- * nhận dạng lời thoại bằng Vosk (offline), dịch sang tiếng Việt bằng ML Kit,
- * và hiển thị phụ đề nổi trên màn hình.
+ * CHẾ ĐỘ DỊCH PHIM — 2 kiểu:
+ *  📖 "sub"   : hiện phụ đề tiếng Việt nổi (mỗi câu hiện đủ lâu để đọc kịp)
+ *  🔊 "voice" : đọc to bản dịch bằng giọng tiếng Việt (loa / tai nghe Bluetooth)
  */
 class MovieActivity : AppCompatActivity() {
 
@@ -44,6 +43,15 @@ class MovieActivity : AppCompatActivity() {
         MovieLang("🇩🇪 Tiếng Đức", "de", "vosk-model-small-de-0.15"),
         MovieLang("🇪🇸 Tiếng Tây Ban Nha", "es", "vosk-model-small-es-0.42"),
         MovieLang("🇷🇺 Tiếng Nga", "ru", "vosk-model-small-ru-0.22"),
+        MovieLang("🇮🇹 Tiếng Ý", "it", "vosk-model-small-it-0.22"),
+        MovieLang("🇵🇹 Tiếng Bồ Đào Nha", "pt", "vosk-model-small-pt-0.3"),
+        MovieLang("🇳🇱 Tiếng Hà Lan", "nl", "vosk-model-small-nl-0.22"),
+        MovieLang("🇹🇷 Tiếng Thổ Nhĩ Kỳ", "tr", "vosk-model-small-tr-0.3"),
+        MovieLang("🇮🇳 Tiếng Hindi", "hi", "vosk-model-small-hi-0.22"),
+        MovieLang("🇵🇱 Tiếng Ba Lan", "pl", "vosk-model-small-pl-0.22"),
+        MovieLang("🇺🇦 Tiếng Ukraina", "uk", "vosk-model-small-uk-v3-small"),
+        MovieLang("🇨🇿 Tiếng Séc", "cs", "vosk-model-small-cs-0.4-rhasspy"),
+        MovieLang("🇮🇷 Tiếng Ba Tư (Iran)", "fa", "vosk-model-small-fa-0.5"),
     )
 
     private lateinit var spinner: Spinner
@@ -51,6 +59,7 @@ class MovieActivity : AppCompatActivity() {
     private lateinit var progress: ProgressBar
 
     private val selected get() = movieLangs[spinner.selectedItemPosition]
+    private var pendingMode = MovieTranslateService.MODE_SUBTITLE
 
     private fun modelDir(m: MovieLang) = File(filesDir, "models/${m.voskModel}")
 
@@ -63,9 +72,13 @@ class MovieActivity : AppCompatActivity() {
                     putExtra("data", result.data)
                     putExtra("modelPath", modelDir(selected).absolutePath)
                     putExtra("srcLang", selected.mlkit)
+                    putExtra("mode", pendingMode)
                 }
                 startForegroundService(svc)
-                tvStatus.text = "✅ Đang dịch. Hãy mở phim/video. Phụ đề sẽ hiện nổi trên màn hình."
+                tvStatus.text = if (pendingMode == MovieTranslateService.MODE_VOICE)
+                    "✅ Đang dịch bằng tiếng. Hãy mở phim — giọng Việt sẽ đọc qua loa/tai nghe."
+                else
+                    "✅ Đang dịch phụ đề. Hãy mở phim — phụ đề Việt hiện nổi trên màn hình."
             } else {
                 tvStatus.text = "Bạn chưa cho phép ghi âm thanh màn hình."
             }
@@ -96,7 +109,14 @@ class MovieActivity : AppCompatActivity() {
             } else toast("Đã có quyền hiển thị nổi ✅")
         }
 
-        findViewById<Button>(R.id.btnStartCapture).setOnClickListener { startCapture() }
+        // 📖 Chế độ phụ đề
+        findViewById<Button>(R.id.btnStartSub).setOnClickListener {
+            startCapture(MovieTranslateService.MODE_SUBTITLE)
+        }
+        // 🔊 Chế độ đọc tiếng
+        findViewById<Button>(R.id.btnStartVoice).setOnClickListener {
+            startCapture(MovieTranslateService.MODE_VOICE)
+        }
 
         findViewById<Button>(R.id.btnStopCapture).setOnClickListener {
             startService(Intent(this, MovieTranslateService::class.java).apply {
@@ -106,15 +126,17 @@ class MovieActivity : AppCompatActivity() {
         }
     }
 
-    private fun startCapture() {
+    private fun startCapture(mode: String) {
         if (!modelDir(selected).exists()) {
             toast("Hãy tải mô hình nhận dạng trước (nút ⬇️)")
             return
         }
-        if (!Settings.canDrawOverlays(this)) {
+        // Chế độ phụ đề mới cần quyền overlay; chế độ đọc tiếng thì không bắt buộc
+        if (mode == MovieTranslateService.MODE_SUBTITLE && !Settings.canDrawOverlays(this)) {
             toast("Hãy cấp quyền hiển thị phụ đề nổi trước (nút 🪟)")
             return
         }
+        pendingMode = mode
         val mpm = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         projectionLauncher.launch(mpm.createScreenCaptureIntent())
     }
@@ -157,13 +179,11 @@ class MovieActivity : AppCompatActivity() {
                 }
                 withContext(Dispatchers.Main) { tvStatus.text = "Đang giải nén…" }
 
-                // Giải nén vào filesDir/models/ (zip chứa sẵn thư mục tên mô hình)
                 val outRoot = File(filesDir, "models").apply { mkdirs() }
                 ZipInputStream(zipFile.inputStream().buffered()).use { zis ->
                     var entry = zis.nextEntry
                     while (entry != null) {
                         val f = File(outRoot, entry.name)
-                        // Chống zip-slip
                         if (!f.canonicalPath.startsWith(outRoot.canonicalPath)) {
                             entry = zis.nextEntry; continue
                         }
@@ -178,7 +198,7 @@ class MovieActivity : AppCompatActivity() {
                 zipFile.delete()
                 withContext(Dispatchers.Main) {
                     progress.visibility = android.view.View.GONE
-                    tvStatus.text = "✅ Đã tải xong mô hình ${lang.label}. Có thể bắt đầu dịch phim."
+                    tvStatus.text = "✅ Đã tải xong mô hình ${lang.label}. Chọn 📖 hoặc 🔊 để bắt đầu."
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
