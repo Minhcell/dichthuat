@@ -1,85 +1,98 @@
 <?xml version="1.0" encoding="utf-8"?>
-<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
-    android:layout_height="match_parent"
-    android:orientation="vertical"
-    android:padding="16dp">
+    android:layout_height="match_parent">
 
-    <TextView
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:text="🎬 Dịch phim / video không phụ đề"
-        android:textSize="18sp"
-        android:textStyle="bold" />
-
-    <TextView
+    <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:paddingTop="8dp"
-        android:text="Máy sẽ nghe âm thanh đang phát trên điện thoại (YouTube, video, phim…), nhận dạng lời thoại và hiển thị phụ đề tiếng Việt nổi trên màn hình.\n\nBước 1: Chọn ngôn ngữ của phim và tải mô hình nhận dạng (chỉ tải 1 lần, ~40–70 MB).\nBước 2: Cấp quyền hiển thị trên ứng dụng khác.\nBước 3: Bấm Bắt đầu → cho phép ghi âm thanh màn hình → mở phim." />
+        android:orientation="vertical"
+        android:padding="16dp">
 
-    <TextView
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:paddingTop="12dp"
-        android:text="Ngôn ngữ của phim:"
-        android:textStyle="bold" />
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="🎬 Dịch phim / video không phụ đề"
+            android:textSize="18sp"
+            android:textStyle="bold" />
 
-    <Spinner
-        android:id="@+id/spinnerMovieLang"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content" />
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:paddingTop="8dp"
+            android:text="Máy nghe âm thanh đang phát trên điện thoại (YouTube, video, phim…) rồi dịch sang tiếng Việt theo 1 trong 2 cách:\n\n📖 DỊCH PHỤ ĐỀ: hiện chữ tiếng Việt nổi trên màn hình, mỗi câu hiện đủ lâu để đọc kịp.\n\n🔊 DỊCH BẰNG TIẾNG: đọc to bản dịch bằng giọng tiếng Việt qua loa điện thoại hoặc tai nghe Bluetooth — không cần nhìn chữ.\n\nBước 1: Chọn ngôn ngữ phim → tải mô hình (1 lần, ~40–70 MB).\nBước 2: Cấp quyền hiển thị nổi (chỉ cần cho chế độ phụ đề).\nBước 3: Bấm nút chế độ muốn dùng → cho phép ghi âm thanh màn hình → mở phim." />
 
-    <Button
-        android:id="@+id/btnDownloadModel"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="8dp"
-        android:text="⬇️ Tải mô hình nhận dạng giọng nói" />
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:paddingTop="12dp"
+            android:text="Ngôn ngữ của phim:"
+            android:textStyle="bold" />
 
-    <ProgressBar
-        android:id="@+id/progress"
-        style="?android:attr/progressBarStyleHorizontal"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:visibility="gone" />
+        <Spinner
+            android:id="@+id/spinnerMovieLang"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content" />
 
-    <TextView
-        android:id="@+id/tvMovieStatus"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:paddingTop="8dp"
-        android:text=""
-        android:textColor="#1565C0" />
+        <Button
+            android:id="@+id/btnDownloadModel"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="⬇️ Tải mô hình nhận dạng giọng nói" />
 
-    <Button
-        android:id="@+id/btnOverlayPerm"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="8dp"
-        android:text="🪟 Cấp quyền hiển thị phụ đề nổi" />
+        <ProgressBar
+            android:id="@+id/progress"
+            style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:visibility="gone" />
 
-    <Button
-        android:id="@+id/btnStartCapture"
-        android:layout_width="match_parent"
-        android:layout_height="60dp"
-        android:layout_marginTop="8dp"
-        android:backgroundTint="#2E7D32"
-        android:text="▶️ Bắt đầu dịch phim" />
+        <TextView
+            android:id="@+id/tvMovieStatus"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:paddingTop="8dp"
+            android:text=""
+            android:textColor="#1565C0" />
 
-    <Button
-        android:id="@+id/btnStopCapture"
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:layout_marginTop="8dp"
-        android:backgroundTint="#C62828"
-        android:text="⏹ Dừng" />
+        <Button
+            android:id="@+id/btnOverlayPerm"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="🪟 Cấp quyền hiển thị phụ đề nổi" />
 
-    <TextView
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:paddingTop="12dp"
-        android:text="⚠️ Lưu ý: các app có bản quyền (Netflix, Disney+…) chặn ghi âm thanh nên không dịch được. YouTube, trình phát video, web thường hoạt động tốt."
-        android:textColor="#B26A00"
-        android:textSize="13sp" />
-</LinearLayout>
+        <Button
+            android:id="@+id/btnStartSub"
+            android:layout_width="match_parent"
+            android:layout_height="60dp"
+            android:layout_marginTop="12dp"
+            android:backgroundTint="#2E7D32"
+            android:text="📖 Dịch phụ đề (hiện chữ)" />
+
+        <Button
+            android:id="@+id/btnStartVoice"
+            android:layout_width="match_parent"
+            android:layout_height="60dp"
+            android:layout_marginTop="8dp"
+            android:backgroundTint="#6A1B9A"
+            android:text="🔊 Dịch bằng tiếng (đọc to tiếng Việt)" />
+
+        <Button
+            android:id="@+id/btnStopCapture"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:backgroundTint="#C62828"
+            android:text="⏹ Dừng" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:paddingTop="12dp"
+            android:text="💡 Mẹo cho chế độ đọc tiếng: giảm nhỏ âm lượng phim một chút để nghe rõ giọng dịch. Giọng dịch phát qua kênh riêng nên không bị máy nghe nhầm lại.\n\n⚠️ Netflix, Disney+… chặn ghi âm thanh (DRM) nên không dịch được. YouTube, trình phát video, web hoạt động tốt."
+            android:textColor="#B26A00"
+            android:textSize="13sp" />
+    </LinearLayout>
+</ScrollView>
