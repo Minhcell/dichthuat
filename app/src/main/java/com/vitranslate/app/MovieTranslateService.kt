@@ -40,9 +40,11 @@ import kotlin.concurrent.thread
  *     không đè mất câu đang đọc — giống "chạy chữ chậm".
  *
  *  🔊 MODE_VOICE: đọc to bản dịch bằng giọng tiếng Việt (Google TTS).
- *     Giọng phát qua kênh MEDIA bình thường → chắc chắn ra loa hoặc tai nghe
- *     Bluetooth, chỉnh bằng nút âm lượng. Chống vòng lặp bằng cách tạm ngừng
- *     nhận dạng trong lúc giọng Việt đang đọc (cờ ttsSpeaking).
+ *     - Giọng phát qua kênh MEDIA → ra loa hoặc tai nghe Bluetooth.
+ *     - Khi đọc, app phát phim bị "duck" (tự giảm âm lượng) → giọng dịch
+ *       luôn to rõ hơn tiếng phim.
+ *     - Capture loại trừ chính app (excludeUid) → nghe phim LIÊN TỤC,
+ *       không bỏ sót thoại kể cả trong lúc giọng Việt đang đọc.
  */
 class MovieTranslateService : Service() {
 
@@ -74,9 +76,9 @@ class MovieTranslateService : Service() {
     private var ttsReady = false
     private val pendingUtterances = AtomicInteger(0)
 
-    // Cờ báo "giọng Việt đang đọc" → tạm ngừng đưa âm thanh vào bộ nhận dạng
-    // để máy không nghe nhầm lại chính giọng dịch của mình (vòng lặp)
-    @Volatile private var ttsSpeaking = false
+    // Audio focus: khi giọng Việt đọc, yêu cầu focus "duck" → app phát phim
+    // (YouTube, trình phát video…) TỰ GIẢM ÂM LƯỢNG, giọng dịch nổi lên rõ
+    private var focusRequest: android.media.AudioFocusRequest? = null
 
     // Các câu dịch xong TRƯỚC khi TTS khởi động kịp → giữ lại đọc sau
     private val earlyQueue = ArrayDeque<String>()
@@ -172,7 +174,7 @@ class MovieTranslateService : Service() {
                 }
                 return@OnInitListener
             }
-            tts?.setSpeechRate(1.1f) // đọc nhanh hơn một chút để theo kịp phim
+            tts?.setSpeechRate(1.25f) // đọc nhanh để theo kịp phim, giảm độ trễ
 
             // Kênh MEDIA: chắc chắn phát ra loa hoặc tai nghe Bluetooth,
             // chỉnh âm lượng bằng nút volume như nhạc/phim
@@ -183,19 +185,22 @@ class MovieTranslateService : Service() {
                     .build()
             )
 
-            // Chống vòng lặp: trong lúc giọng Việt đang đọc, tạm NGỪNG đưa
-            // âm thanh vào bộ nhận dạng (xem cờ ttsSpeaking ở vòng lặp ghi âm)
+            // LÀM GIỌNG DỊCH TO HƠN TIẾNG PHIM: khi bắt đầu đọc, xin audio
+            // focus kiểu "duck" → app phát phim tự hạ âm lượng xuống thấp;
+            // đọc xong trả focus → tiếng phim to lại như cũ
             tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                override fun onStart(id: String?) { ttsSpeaking = true }
+                override fun onStart(id: String?) { duckMovieAudio(true) }
                 override fun onDone(id: String?) {
                     pendingUtterances.decrementAndGet()
-                    // chờ thêm 300ms cho dư âm tan hết rồi mới nghe tiếp
-                    ui.postDelayed({ if (pendingUtterances.get() <= 0) ttsSpeaking = false }, 300)
+                    // chờ 400ms: nếu không còn câu nào chờ đọc thì trả lại âm lượng phim
+                    ui.postDelayed({
+                        if (pendingUtterances.get() <= 0) duckMovieAudio(false)
+                    }, 400)
                 }
                 @Deprecated("Deprecated in Java")
                 override fun onError(id: String?) {
                     pendingUtterances.decrementAndGet()
-                    ttsSpeaking = false
+                    duckMovieAudio(false)
                 }
             })
 
@@ -228,10 +233,14 @@ class MovieTranslateService : Service() {
     }
 
     private fun startAudioCapture() {
+        // QUAN TRỌNG (giảm trễ + không sót lời thoại):
+        // Thay vì lọc theo loại âm thanh (MEDIA/GAME) rồi phải TẠM DỪNG nghe
+        // khi giọng Việt đọc, giờ ta loại trừ CHÍNH APP MÌNH (excludeUid).
+        // → Giọng dịch của app không bao giờ bị ghi lại, còn tiếng phim thì
+        //   được nghe LIÊN TỤC — kể cả trong lúc giọng Việt đang đọc.
+        //   Không còn khoảng "điếc" nên không bỏ sót câu thoại nào.
         val config = AudioPlaybackCaptureConfiguration.Builder(projection!!)
-            .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
-            .addMatchingUsage(AudioAttributes.USAGE_GAME)
-            .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+            .excludeUid(android.os.Process.myUid())
             .build()
 
         val format = AudioFormat.Builder()
@@ -260,10 +269,6 @@ class MovieTranslateService : Service() {
         while (running) {
             val n = audioRecord?.read(buf, 0, buf.size) ?: -1
             if (n <= 0) continue
-            // Khi giọng Việt đang đọc (chế độ đọc tiếng): vẫn đọc dữ liệu để
-            // xả bộ đệm nhưng KHÔNG đưa vào bộ nhận dạng — tránh máy nghe
-            // nhầm lại giọng dịch của chính mình
-            if (mode == MODE_VOICE && ttsSpeaking) continue
             val rec = recognizer ?: break
             if (rec.acceptWaveForm(buf, n)) {
                 // Câu hoàn chỉnh → dịch
@@ -299,6 +304,33 @@ class MovieTranslateService : Service() {
 
     // ---------------- 🔊 CHẾ ĐỘ ĐỌC TIẾNG ----------------
 
+    /**
+     * Nén / trả lại âm lượng phim bằng audio focus:
+     *  duck = true  → xin focus GAIN_TRANSIENT_MAY_DUCK: app phát phim
+     *                 tự giảm âm lượng (YouTube giảm còn ~20%), giọng dịch nổi rõ
+     *  duck = false → trả focus: tiếng phim to lại bình thường
+     */
+    private fun duckMovieAudio(duck: Boolean) {
+        val am = getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
+        if (duck) {
+            if (focusRequest == null) {
+                focusRequest = android.media.AudioFocusRequest.Builder(
+                    android.media.AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK
+                )
+                    .setAudioAttributes(
+                        AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                            .build()
+                    )
+                    .build()
+            }
+            am.requestAudioFocus(focusRequest!!)
+        } else {
+            focusRequest?.let { am.abandonAudioFocusRequest(it) }
+        }
+    }
+
     private fun speakVi(text: String) {
         if (!ttsReady) {
             // TTS chưa khởi động xong → giữ lại, đọc ngay khi sẵn sàng
@@ -306,9 +338,9 @@ class MovieTranslateService : Service() {
             while (earlyQueue.size > 3) earlyQueue.removeFirst()
             return
         }
-        // Nếu giọng đọc bị tồn đọng quá 2 câu (phim nói nhanh) → bỏ câu cũ,
-        // đọc câu mới nhất để không bị trễ so với hình
-        val queueMode = if (pendingUtterances.get() >= 2) {
+        // Chỉ khi tồn đọng quá 3 câu (phim nói rất nhanh) mới bỏ câu cũ —
+        // nới ngưỡng so với trước để dịch ĐẦY ĐỦ hơn, ít bỏ sót câu
+        val queueMode = if (pendingUtterances.get() >= 3) {
             pendingUtterances.set(0)
             TextToSpeech.QUEUE_FLUSH
         } else TextToSpeech.QUEUE_ADD
@@ -433,6 +465,7 @@ class MovieTranslateService : Service() {
         model?.close(); model = null
         projection?.stop(); projection = null
         tts?.stop(); tts?.shutdown(); tts = null
+        duckMovieAudio(false) // trả lại âm lượng phim
         ui.post {
             subQueue.clear()
             visiblePairs.clear()
