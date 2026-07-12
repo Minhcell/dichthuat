@@ -38,12 +38,12 @@
         android:textColor="#1565C0" />
 
     <Button
-        android:id="@+id/btnAuto"
+        android:id="@+id/btnFile"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:layout_marginTop="4dp"
         android:backgroundTint="#6A1B9A"
-        android:text="🔁 Hội thoại tự động (rảnh tay — mỗi người 1 tai nghe)" />
+        android:text="🎵 Dịch file ghi âm" />
 
     <Button
         android:id="@+id/btnClearLog"
