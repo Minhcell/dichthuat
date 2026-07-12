@@ -229,14 +229,32 @@ class MovieTranslateService : Service() {
 
     private fun startAudioCapture() {
         // QUAN TRỌNG (giảm trễ + không sót lời thoại):
-        // Thay vì lọc theo loại âm thanh (MEDIA/GAME) rồi phải TẠM DỪNG nghe
-        // khi giọng Việt đọc, giờ ta loại trừ CHÍNH APP MÌNH (excludeUid).
-        // → Giọng dịch của app không bao giờ bị ghi lại, còn tiếng phim thì
-        //   được nghe LIÊN TỤC — kể cả trong lúc giọng Việt đang đọc.
-        //   Không còn khoảng "điếc" nên không bỏ sót câu thoại nào.
-        val config = AudioPlaybackCaptureConfiguration.Builder(projection!!)
+        // Loại trừ CHÍNH APP MÌNH (excludeUid) để nghe phim liên tục.
+        val builder = AudioPlaybackCaptureConfiguration.Builder(projection!!)
             .excludeUid(android.os.Process.myUid())
-            .build()
+
+        // SỬA LỖI "DỊCH MA" KHI TẠM DỪNG VIDEO:
+        // Giọng đọc TTS được PHÁT TỪ TIẾN TRÌNH CỦA ENGINE (vd: app Google
+        // Text-to-Speech) chứ không phải từ app mình → excludeUid(app mình)
+        // KHÔNG chặn được nó. Khi video tạm dừng, âm thanh duy nhất còn lại
+        // là giọng dịch → máy nghe lại chính mình → dịch lặp vô hạn.
+        // Cách sửa: loại trừ thêm UID của TẤT CẢ engine TTS có trên máy.
+        try {
+            val engines = packageManager.queryIntentServices(
+                Intent("android.intent.action.TTS_SERVICE"), 0
+            )
+            val excluded = HashSet<Int>()
+            excluded.add(android.os.Process.myUid())
+            for (ri in engines) {
+                try {
+                    val uid = packageManager
+                        .getApplicationInfo(ri.serviceInfo.packageName, 0).uid
+                    if (excluded.add(uid)) builder.excludeUid(uid)
+                } catch (_: Exception) {}
+            }
+        } catch (_: Exception) {}
+
+        val config = builder.build()
 
         val format = AudioFormat.Builder()
             .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
