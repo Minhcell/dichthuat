@@ -39,10 +39,10 @@ import kotlin.concurrent.thread
  *     đủ lâu để đọc kịp (thời gian tỉ lệ với độ dài câu). Câu mới xếp hàng đợi,
  *     không đè mất câu đang đọc — giống "chạy chữ chậm".
  *
- *  🔊 MODE_VOICE: đọc to bản dịch bằng giọng tiếng Việt (TextToSpeech).
- *     Giọng đọc phát qua kênh ASSISTANCE (không phải MEDIA) nên:
- *     - Tự phát ra loa hoặc tai nghe Bluetooth đang kết nối.
- *     - KHÔNG bị AudioPlaybackCapture nghe nhầm lại (tránh vòng lặp).
+ *  🔊 MODE_VOICE: đọc to bản dịch bằng giọng tiếng Việt (Google TTS).
+ *     Giọng phát qua kênh MEDIA bình thường → chắc chắn ra loa hoặc tai nghe
+ *     Bluetooth, chỉnh bằng nút âm lượng. Chống vòng lặp bằng cách tạm ngừng
+ *     nhận dạng trong lúc giọng Việt đang đọc (cờ ttsSpeaking).
  */
 class MovieTranslateService : Service() {
 
@@ -73,6 +73,13 @@ class MovieTranslateService : Service() {
     private var tts: TextToSpeech? = null
     private var ttsReady = false
     private val pendingUtterances = AtomicInteger(0)
+
+    // Cờ báo "giọng Việt đang đọc" → tạm ngừng đưa âm thanh vào bộ nhận dạng
+    // để máy không nghe nhầm lại chính giọng dịch của mình (vòng lặp)
+    @Volatile private var ttsSpeaking = false
+
+    // Các câu dịch xong TRƯỚC khi TTS khởi động kịp → giữ lại đọc sau
+    private val earlyQueue = ArrayDeque<String>()
 
     // ----- Hàng đợi phụ đề (hiện chậm, đọc kịp) -----
     private val subQueue = ArrayDeque<String>()
@@ -125,26 +132,77 @@ class MovieTranslateService : Service() {
     }
 
     private fun initTts() {
-        tts = TextToSpeech(this) { status ->
-            ttsReady = status == TextToSpeech.SUCCESS
-            if (ttsReady) {
-                tts?.language = Locale("vi", "VN")
-                tts?.setSpeechRate(1.1f) // đọc nhanh hơn một chút để theo kịp phim
-                // QUAN TRỌNG: dùng kênh ASSISTANCE thay vì MEDIA để
-                // giọng dịch KHÔNG bị máy ghi lại (vòng lặp âm thanh)
-                tts?.setAudioAttributes(
-                    AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                        .build()
-                )
-                tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                    override fun onStart(id: String?) {}
-                    override fun onDone(id: String?) { pendingUtterances.decrementAndGet() }
-                    @Deprecated("Deprecated in Java")
-                    override fun onError(id: String?) { pendingUtterances.decrementAndGet() }
-                })
+        // Ưu tiên Google TTS (có giọng tiếng Việt chuẩn). Máy Xiaomi hay đặt
+        // engine TTS mặc định của hãng — engine đó KHÔNG có tiếng Việt
+        // nên app sẽ im lặng. Nếu máy không có Google TTS thì dùng engine mặc định.
+        val googleEngine = "com.google.android.tts"
+        val hasGoogle = try {
+            packageManager.getPackageInfo(googleEngine, 0); true
+        } catch (e: Exception) { false }
+
+        val listener = TextToSpeech.OnInitListener { status ->
+            if (status != TextToSpeech.SUCCESS) {
+                notifyUser("❌ Không khởi động được Text-to-Speech")
+                return@OnInitListener
             }
+            val res = tts?.setLanguage(Locale("vi", "VN"))
+            if (res == TextToSpeech.LANG_MISSING_DATA || res == TextToSpeech.LANG_NOT_SUPPORTED) {
+                notifyUser(
+                    "❌ Máy chưa có giọng đọc tiếng Việt.\n" +
+                    "Cài app 'Google Text-to-Speech' từ Play Store, rồi vào " +
+                    "Cài đặt > Hệ thống > Chuyển văn bản thành giọng nói > chọn Google."
+                )
+                return@OnInitListener
+            }
+            tts?.setSpeechRate(1.1f) // đọc nhanh hơn một chút để theo kịp phim
+
+            // Dùng kênh MEDIA bình thường: chắc chắn phát ra loa hoặc tai nghe
+            // Bluetooth, chỉnh âm lượng bằng nút volume như nhạc/phim.
+            // (Kênh "navigation" trước đây bị nhiều máy Xiaomi chặn/tắt tiếng.)
+            tts?.setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+            )
+
+            // Chống vòng lặp: trong lúc giọng Việt đang đọc, tạm NGỪNG đưa
+            // âm thanh vào bộ nhận dạng (xem cờ ttsSpeaking ở vòng lặp ghi âm)
+            tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                override fun onStart(id: String?) { ttsSpeaking = true }
+                override fun onDone(id: String?) {
+                    pendingUtterances.decrementAndGet()
+                    // chờ thêm 300ms cho dư âm tan hết rồi mới nghe tiếp
+                    ui.postDelayed({ if (pendingUtterances.get() <= 0) ttsSpeaking = false }, 300)
+                }
+                @Deprecated("Deprecated in Java")
+                override fun onError(id: String?) {
+                    pendingUtterances.decrementAndGet()
+                    ttsSpeaking = false
+                }
+            })
+
+            ttsReady = true
+            // Câu chào kiểm tra: nghe thấy câu này = TTS hoạt động tốt
+            pendingUtterances.incrementAndGet()
+            tts?.speak(
+                "Chế độ dịch bằng tiếng đã sẵn sàng",
+                TextToSpeech.QUEUE_FLUSH, null, "movie_hello"
+            )
+            // Đọc nốt các câu đã dịch xong trong lúc TTS còn đang khởi động
+            ui.post {
+                while (earlyQueue.isNotEmpty()) speakVi(earlyQueue.removeFirst())
+            }
+        }
+
+        tts = if (hasGoogle) TextToSpeech(this, listener, googleEngine)
+              else TextToSpeech(this, listener)
+    }
+
+    /** Hiện thông báo cho người dùng dù đang ở app khác (Toast từ service) */
+    private fun notifyUser(msg: String) {
+        ui.post {
+            android.widget.Toast.makeText(this, msg, android.widget.Toast.LENGTH_LONG).show()
         }
     }
 
@@ -181,6 +239,10 @@ class MovieTranslateService : Service() {
         while (running) {
             val n = audioRecord?.read(buf, 0, buf.size) ?: -1
             if (n <= 0) continue
+            // Khi giọng Việt đang đọc (chế độ đọc tiếng): vẫn đọc dữ liệu để
+            // xả bộ đệm nhưng KHÔNG đưa vào bộ nhận dạng — tránh máy nghe
+            // nhầm lại giọng dịch của chính mình
+            if (mode == MODE_VOICE && ttsSpeaking) continue
             val rec = recognizer ?: break
             if (rec.acceptWaveForm(buf, n)) {
                 // Câu hoàn chỉnh → dịch
@@ -208,6 +270,7 @@ class MovieTranslateService : Service() {
             },
             onError = { err ->
                 if (mode == MODE_SUBTITLE) ui.post { showOverlay(err) }
+                else notifyUser(err)
             }
         )
     }
@@ -215,7 +278,12 @@ class MovieTranslateService : Service() {
     // ---------------- 🔊 CHẾ ĐỘ ĐỌC TIẾNG ----------------
 
     private fun speakVi(text: String) {
-        if (!ttsReady) return
+        if (!ttsReady) {
+            // TTS chưa khởi động xong → giữ lại, đọc ngay khi sẵn sàng
+            earlyQueue.addLast(text)
+            while (earlyQueue.size > 3) earlyQueue.removeFirst()
+            return
+        }
         // Nếu giọng đọc bị tồn đọng quá 2 câu (phim nói nhanh) → bỏ câu cũ,
         // đọc câu mới nhất để không bị trễ so với hình
         val queueMode = if (pendingUtterances.get() >= 2) {
@@ -223,7 +291,10 @@ class MovieTranslateService : Service() {
             TextToSpeech.QUEUE_FLUSH
         } else TextToSpeech.QUEUE_ADD
         pendingUtterances.incrementAndGet()
-        tts?.speak(text, queueMode, null, "movie_${System.nanoTime()}")
+        val params = android.os.Bundle().apply {
+            putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f) // âm lượng tối đa
+        }
+        tts?.speak(text, queueMode, params, "movie_${System.nanoTime()}")
     }
 
     // ---------------- 📖 CHẾ ĐỘ PHỤ ĐỀ (hiện chậm) ----------------
