@@ -118,7 +118,7 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             startListening(viToForeign = false)
         }
         findViewById<Button>(R.id.btnAuto).setOnClickListener {
-            if (autoMode) stopAutoMode() else startAutoMode()
+            if (autoMode) stopAutoMode() else chooseStartLanguage()
         }
         findViewById<Button>(R.id.btnMovie).setOnClickListener {
             stopAutoMode()
@@ -238,14 +238,16 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                         if (switchSpeak.isChecked || autoMode) {
                             speak(translated, if (isVietnamese) selected.tts else Locale("vi", "VN")) {
                                 // Đọc xong bản dịch → nếu đang ở chế độ tự động thì
-                                // chuyển lượt nghe cho NGƯỜI KIA và nghe tiếp
+                                // BÍP báo lượt và chuyển sang nghe NGƯỜI KIA
                                 if (autoMode) {
                                     autoListenVi = !isVietnamese
+                                    beep()
                                     ui.postDelayed({ autoListenLoop() }, 350)
                                 }
                             }
                         } else if (autoMode) {
                             autoListenVi = !isVietnamese
+                            beep()
                             ui.postDelayed({ autoListenLoop() }, 350)
                         }
                     }
@@ -262,33 +264,66 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     /* ================================================================
        🔁 HỘI THOẠI TỰ ĐỘNG (RẢNH TAY) — kiểu tai nghe phiên dịch:
-       Điện thoại đặt giữa 2 người (hoặc dùng micro tai nghe Bluetooth,
-       mỗi người đeo 1 bên tai của cặp tai nghe TWS).
+       Dùng loa ngoài (đặt điện thoại giữa 2 người) HOẶC tai nghe
+       Bluetooth (bật công tắc Bluetooth, mỗi người đeo 1 bên tai).
 
        Cách hoạt động — vòng lặp "ping-pong":
-       1. Nghe tiếng Việt trước. Người 1 nói → dịch → đọc to ngoại ngữ.
-       2. Đọc xong tự chuyển sang NGHE NGOẠI NGỮ (đến lượt người 2).
-          Người 2 nói → dịch → đọc to tiếng Việt → chuyển về nghe tiếng Việt.
-       3. Nếu chờ mà không ai nói (hết giờ) → tự ĐẢO lượt nghe, phòng khi
-          người kia chưa nói mà người này nói tiếp.
-       4. ML Kit Language ID kiểm tra lại từng câu: nói "trái lượt" vẫn
-          được dịch đúng chiều.
-       Không ai phải bấm nút — như hai người nói chuyện trực tiếp.
+       1. Chọn thứ tiếng bắt đầu (Việt hoặc ngoại ngữ) khi bấm nút.
+       2. Nghe → nhận câu → hiện CẢ 2 DÒNG (câu gốc + bản dịch) →
+          ĐỌC TO bản dịch cho người kia nghe.
+       3. Đọc xong: BÍP một tiếng + tự chuyển sang nghe thứ tiếng còn lại.
+       4. Không ai nói trong lượt → bíp + tự đảo lượt nghe.
+       5. ML Kit Language ID kiểm lại từng câu: nói "trái lượt" vẫn dịch đúng.
+
+       Kỹ thuật ổn định (sửa lỗi "không nhận được giọng nói"):
+       - Dùng MỘT SpeechRecognizer duy nhất cho cả phiên, không hủy/tạo lại
+         liên tục (tạo lại mỗi vòng gây lỗi ERROR_BUSY/CLIENT trên nhiều máy
+         → máy im lặng không nghe gì).
+       - Gặp lỗi BUSY/CLIENT: cancel() rồi nghe lại; lỗi 4 lần liên tiếp
+         mới hủy tạo recognizer mới.
        ================================================================ */
 
     private var autoMode = false
     private var autoListenVi = true // lượt hiện tại: true = đang chờ tiếng Việt
+    private var autoRec: SpeechRecognizer? = null
+    private var autoErrStreak = 0
     private val ui = android.os.Handler(android.os.Looper.getMainLooper())
+    private var beeper: android.media.ToneGenerator? = null
 
-    private fun startAutoMode() {
+    /** Hỏi thứ tiếng bắt đầu rồi mới chạy hội thoại tự động */
+    private fun chooseStartLanguage() {
+        androidx.appcompat.app.AlertDialog.Builder(this)
+            .setTitle("Bắt đầu nghe thứ tiếng nào trước?")
+            .setItems(arrayOf("🟢 Tiếng Việt nói trước", "🔴 ${selected.label} nói trước")) { _, which ->
+                startAutoMode(startWithVi = which == 0)
+            }
+            .show()
+    }
+
+    private fun startAutoMode(startWithVi: Boolean) {
         if (!SpeechRecognizer.isRecognitionAvailable(this)) {
             toast("Máy chưa có dịch vụ nhận dạng giọng nói (cần app Google)")
             return
         }
+        // Dừng nghe thủ công nếu đang chạy, tránh tranh chấp micro
+        recognizer?.destroy(); recognizer = null
+
         autoMode = true
-        autoListenVi = true
+        autoListenVi = startWithVi
+        autoErrStreak = 0
+        beeper = try {
+            android.media.ToneGenerator(android.media.AudioManager.STREAM_MUSIC, 85)
+        } catch (e: Exception) { null }
+
+        autoRec = SpeechRecognizer.createSpeechRecognizer(this)
+        autoRec?.setRecognitionListener(autoListener)
+
         findViewById<Button>(R.id.btnAuto).text = "⏹ Dừng hội thoại tự động"
-        appendSystemLog("🔁 Bắt đầu hội thoại tự động: Việt ↔ ${selected.label}. Cứ nói tự nhiên, máy tự dịch và đọc to.")
+        appendSystemLog(
+            "🔁 Hội thoại tự động: Việt ↔ ${selected.label}. " +
+            "Nghe ${if (startWithVi) "TIẾNG VIỆT" else selected.label} trước. " +
+            "Sau mỗi tiếng BÍP là đến lượt người kia nói."
+        )
         autoListenLoop()
     }
 
@@ -296,18 +331,86 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         if (!autoMode) return
         autoMode = false
         ui.removeCallbacksAndMessages(null)
-        recognizer?.destroy(); recognizer = null
+        autoRec?.destroy(); autoRec = null
+        beeper?.release(); beeper = null
         tts?.stop()
         findViewById<Button>(R.id.btnAuto).text =
             "🔁 Hội thoại tự động (rảnh tay — mỗi người 1 tai nghe)"
         tvStatus.text = "Đã dừng hội thoại tự động"
     }
 
-    /** Một vòng nghe của chế độ tự động */
+    /** Bíp ngắn báo "đến lượt nói" */
+    private fun beep() {
+        beeper?.startTone(android.media.ToneGenerator.TONE_PROP_BEEP, 130)
+    }
+
+    /** Listener dùng chung cho mọi vòng nghe của chế độ tự động */
+    private val autoListener = object : RecognitionListener {
+        override fun onResults(results: Bundle) {
+            if (!autoMode) return
+            autoErrStreak = 0
+            val text = results
+                .getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                ?.firstOrNull()
+            if (text.isNullOrBlank()) {
+                ui.postDelayed({ autoListenLoop() }, 250)
+                return
+            }
+            tvStatus.text = "Đang dịch…"
+            // handleRecognized hiện 2 dòng (gốc + dịch), đọc to bản dịch,
+            // rồi tự gọi lại autoListenLoop cho lượt tiếp theo
+            handleRecognized(text, autoListenVi)
+        }
+
+        override fun onPartialResults(partial: Bundle) {
+            val t = partial.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                ?.firstOrNull()
+            if (!t.isNullOrBlank()) tvStatus.text = "🎙 $t"
+        }
+
+        override fun onError(error: Int) {
+            if (!autoMode) return
+            when (error) {
+                SpeechRecognizer.ERROR_NO_MATCH,
+                SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> {
+                    // Lượt này không ai nói → bíp + đảo lượt nghe
+                    autoErrStreak = 0
+                    autoListenVi = !autoListenVi
+                    beep()
+                    ui.postDelayed({ autoListenLoop() }, 350)
+                }
+                SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {
+                    tvStatus.text = "Chưa cấp quyền micro"
+                    stopAutoMode()
+                }
+                else -> {
+                    // BUSY / CLIENT / AUDIO…: KHÔNG đảo lượt, thử nghe lại.
+                    // Lỗi 4 lần liên tiếp → tạo recognizer mới cho chắc.
+                    autoErrStreak++
+                    try { autoRec?.cancel() } catch (e: Exception) {}
+                    if (autoErrStreak >= 4) {
+                        autoErrStreak = 0
+                        autoRec?.destroy()
+                        autoRec = SpeechRecognizer.createSpeechRecognizer(this@MainActivity)
+                        autoRec?.setRecognitionListener(this)
+                    }
+                    ui.postDelayed({ autoListenLoop() }, 500)
+                }
+            }
+        }
+
+        override fun onReadyForSpeech(params: Bundle?) {}
+        override fun onBeginningOfSpeech() {}
+        override fun onRmsChanged(rmsdB: Float) {}
+        override fun onBufferReceived(buffer: ByteArray?) {}
+        override fun onEndOfSpeech() { tvStatus.text = "Đang xử lý…" }
+        override fun onEvent(eventType: Int, params: Bundle?) {}
+    }
+
+    /** Một vòng nghe của chế độ tự động (dùng lại recognizer, không tạo mới) */
     private fun autoListenLoop() {
         if (!autoMode) return
-        recognizer?.destroy()
-        recognizer = SpeechRecognizer.createSpeechRecognizer(this)
+        val rec = autoRec ?: return
 
         val sttLang = if (autoListenVi) "vi-VN" else selected.stt
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
@@ -316,59 +419,21 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE, sttLang)
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, sttLang)
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+            // Ngắt câu nhanh hơn: im lặng 1 giây coi như nói xong → dịch ngay
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1000)
+            putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1000)
         }
 
         tvStatus.text = if (autoListenVi)
-            "🟢 Đang chờ TIẾNG VIỆT… (nói tự nhiên)"
+            "🟢 MỜI NÓI TIẾNG VIỆT…"
         else
-            "🔴 Đang chờ ${selected.label}… (speak now)"
+            "🔴 ${selected.label} — SPEAK NOW…"
 
-        recognizer?.setRecognitionListener(object : RecognitionListener {
-            override fun onResults(results: Bundle) {
-                if (!autoMode) return
-                val text = results
-                    .getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                    ?.firstOrNull()
-                if (text.isNullOrBlank()) {
-                    ui.postDelayed({ autoListenLoop() }, 300)
-                    return
-                }
-                tvStatus.text = "Đang dịch…"
-                // handleRecognized sẽ tự đọc to và gọi lại autoListenLoop khi xong
-                handleRecognized(text, autoListenVi)
-            }
-
-            override fun onPartialResults(partial: Bundle) {
-                val t = partial.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                    ?.firstOrNull()
-                if (!t.isNullOrBlank()) tvStatus.text = "🎙 $t"
-            }
-
-            override fun onError(error: Int) {
-                if (!autoMode) return
-                when (error) {
-                    SpeechRecognizer.ERROR_NO_MATCH,
-                    SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> {
-                        // Không ai nói ở lượt này → đảo lượt nghe rồi nghe tiếp
-                        autoListenVi = !autoListenVi
-                        ui.postDelayed({ autoListenLoop() }, 250)
-                    }
-                    SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {
-                        tvStatus.text = "Chưa cấp quyền micro"
-                        stopAutoMode()
-                    }
-                    else -> ui.postDelayed({ autoListenLoop() }, 700)
-                }
-            }
-
-            override fun onReadyForSpeech(params: Bundle?) {}
-            override fun onBeginningOfSpeech() {}
-            override fun onRmsChanged(rmsdB: Float) {}
-            override fun onBufferReceived(buffer: ByteArray?) {}
-            override fun onEndOfSpeech() {}
-            override fun onEvent(eventType: Int, params: Bundle?) {}
-        })
-        recognizer?.startListening(intent)
+        try {
+            rec.startListening(intent)
+        } catch (e: Exception) {
+            ui.postDelayed({ autoListenLoop() }, 600)
+        }
     }
 
     private fun appendSystemLog(msg: String) {
