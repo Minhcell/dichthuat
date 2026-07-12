@@ -101,7 +101,13 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             this, android.R.layout.simple_spinner_dropdown_item, langs.map { it.label }
         )
 
-        tts = TextToSpeech(this, this)
+        // Ưu tiên Google TTS (có giọng tiếng Việt và nhiều ngoại ngữ chuẩn);
+        // nếu máy không có/bị tắt thì onInit sẽ tự chuyển sang engine mặc định
+        tts = try {
+            TextToSpeech(this, this, "com.google.android.tts")
+        } catch (e: Exception) {
+            TextToSpeech(this, this)
+        }
 
         findViewById<Button>(R.id.btnVi).setOnClickListener {
             startListening(viToForeign = true)
@@ -242,9 +248,19 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
 
     // ---------------- ĐỌC TO (TTS) ----------------
 
+    private var triedDefaultEngine = false
+
     override fun onInit(status: Int) {
         ttsReady = status == TextToSpeech.SUCCESS
-        if (!ttsReady) toast("Không khởi động được Text-to-Speech")
+        if (!ttsReady) {
+            if (!triedDefaultEngine) {
+                // Google TTS không có / bị tắt → thử engine mặc định của máy
+                triedDefaultEngine = true
+                tts = TextToSpeech(this, this)
+            } else {
+                toast("Không khởi động được Text-to-Speech. Hãy cài 'Speech Services by Google' từ Play Store.")
+            }
+        }
     }
 
     private fun speak(text: String, locale: Locale) {
