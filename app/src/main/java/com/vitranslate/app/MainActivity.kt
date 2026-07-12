@@ -209,18 +209,40 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         recognizer?.startListening(intent)
     }
 
+    /** Đếm lượt của chế độ tự động — dùng cho bộ giám sát chống treo */
+    private var autoTurnId = 0
+
     /**
      * Xử lý câu vừa nghe được:
-     * 1. Dùng ML Kit Language ID để TỰ PHÁT HIỆN ngôn ngữ thật của câu.
-     * 2. Nếu phát hiện tiếng Việt → dịch VI → ngoại ngữ.
-     *    Nếu phát hiện ngoại ngữ (hoặc không rõ) → dịch → tiếng Việt.
-     *    (Nhờ vậy dù bấm nhầm nút, chiều dịch vẫn đúng.)
+     * 1. HIỆN NGAY câu gốc vào ô hội thoại (để luôn kiểm tra được máy nghe gì).
+     * 2. ML Kit Language ID tự phát hiện ngôn ngữ thật của câu.
+     * 3. Dịch: tiếng Việt → ngoại ngữ, ngoại ngữ → tiếng Việt.
+     * 4. Hiện cặp câu (gốc + dịch) và ĐỌC TO bản dịch.
+     * 5. Bộ giám sát 15 giây: nếu dịch bị treo (mạng chậm, đang tải mô hình)
+     *    thì báo lỗi vào ô hội thoại và cho vòng lặp tự động chạy tiếp,
+     *    không bao giờ đứng im.
      */
     private fun handleRecognized(text: String, viToForeignPressed: Boolean) {
+        // (1) Hiện ngay câu nghe được — chưa cần biết dịch có thành công không
+        appendSystemLog("🎙 Nghe được: \"$text\" — đang dịch…")
+
+        // (5) Bộ giám sát chống treo cho chế độ tự động
+        val myTurn = ++autoTurnId
+        var turnDone = false
+        if (autoMode) {
+            ui.postDelayed({
+                if (autoMode && myTurn == autoTurnId && !turnDone) {
+                    turnDone = true
+                    appendSystemLog("⚠️ Dịch quá lâu (mạng chậm hoặc đang tải mô hình dịch lần đầu ~30MB). Tiếp tục nghe…")
+                    autoListenLoop()
+                }
+            }, 15000)
+        }
+
         TranslateHelper.identifyLanguage(text) { detected ->
             val isVietnamese = when (detected) {
                 "vi" -> true
-                "und" -> viToForeignPressed // không rõ → tin theo nút đã bấm
+                "und" -> viToForeignPressed // không rõ → tin theo nút/lượt hiện tại
                 else -> false
             }
             val src = if (isVietnamese) "vi" else selected.mlkit
@@ -229,23 +251,29 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             TranslateHelper.translate(text, src, dst,
                 onResult = { translated ->
                     runOnUiThread {
+                        if (turnDone) return@runOnUiThread // giám sát đã cho chạy tiếp rồi
                         appendLog(
                             speakerVi = isVietnamese,
                             original = text,
                             translated = translated
                         )
                         tvStatus.text = "Sẵn sàng"
+                        if (!ttsReady && autoMode) {
+                            appendSystemLog("⚠️ Giọng đọc (TTS) chưa sẵn sàng — chỉ hiện chữ, chưa phát tiếng được")
+                        }
                         if (switchSpeak.isChecked || autoMode) {
                             speak(translated, if (isVietnamese) selected.tts else Locale("vi", "VN")) {
                                 // Đọc xong bản dịch → nếu đang ở chế độ tự động thì
                                 // BÍP báo lượt và chuyển sang nghe NGƯỜI KIA
-                                if (autoMode) {
+                                if (autoMode && !turnDone) {
+                                    turnDone = true
                                     autoListenVi = !isVietnamese
                                     beep()
                                     ui.postDelayed({ autoListenLoop() }, 350)
                                 }
                             }
-                        } else if (autoMode) {
+                        } else if (autoMode && !turnDone) {
+                            turnDone = true
                             autoListenVi = !isVietnamese
                             beep()
                             ui.postDelayed({ autoListenLoop() }, 350)
@@ -255,7 +283,11 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
                 onError = { err ->
                     runOnUiThread {
                         tvStatus.text = err
-                        if (autoMode) ui.postDelayed({ autoListenLoop() }, 800)
+                        appendSystemLog("❌ $err")
+                        if (autoMode && !turnDone) {
+                            turnDone = true
+                            ui.postDelayed({ autoListenLoop() }, 800)
+                        }
                     }
                 }
             )
@@ -324,6 +356,15 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             "Nghe ${if (startWithVi) "TIẾNG VIỆT" else selected.label} trước. " +
             "Sau mỗi tiếng BÍP là đến lượt người kia nói."
         )
+        // Tải sẵn mô hình dịch CẢ 2 CHIỀU ngay từ đầu (lần đầu ~30MB/chiều),
+        // để câu đầu tiên không bị treo chờ tải
+        appendSystemLog("⏬ Đang chuẩn bị mô hình dịch 2 chiều (lần đầu có thể mất 1–2 phút, cần mạng)…")
+        TranslateHelper.translate("xin chào", "vi", selected.mlkit,
+            onResult = { runOnUiThread { appendSystemLog("✅ Sẵn sàng dịch Việt → ${selected.label}") } },
+            onError = { e -> runOnUiThread { appendSystemLog("❌ $e") } })
+        TranslateHelper.translate("hello", selected.mlkit, "vi",
+            onResult = { runOnUiThread { appendSystemLog("✅ Sẵn sàng dịch ${selected.label} → Việt") } },
+            onError = { e -> runOnUiThread { appendSystemLog("❌ $e") } })
         autoListenLoop()
     }
 
