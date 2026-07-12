@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ViTranslate</string>
+    <string name="movie_mode">Chế độ dịch phim</string>
+    <string name="i_speak_vi">🎤 Tôi nói\n(Tiếng Việt)</string>
+    <string name="other_speaks">🎤 Người kia nói\n(Ngoại ngữ)</string>
+    <string name="foreign_language">Ngôn ngữ nước ngoài:</string>
+    <string name="bluetooth_headset">Dùng micro tai nghe Bluetooth</string>
+    <string name="open_movie_mode">🎬 Chế độ dịch phim (không phụ đề)</string>
+    <string name="listening">Đang nghe…</string>
+</resources>
