@@ -135,8 +135,8 @@ class MovieActivity : AppCompatActivity() {
             toast("Hãy tải mô hình nhận dạng trước (nút ⬇️)")
             return
         }
-        // Chế độ phụ đề mới cần quyền overlay; chế độ đọc tiếng thì không bắt buộc
-        if (mode == MovieTranslateService.MODE_SUBTITLE && !Settings.canDrawOverlays(this)) {
+        // Cả 2 chế độ giờ đều hiện phụ đề song ngữ → đều cần quyền overlay
+        if (!Settings.canDrawOverlays(this)) {
             toast("Hãy cấp quyền hiển thị phụ đề nổi trước (nút 🪟)")
             return
         }
