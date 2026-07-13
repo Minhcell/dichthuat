@@ -344,30 +344,52 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
         tvStatus.text = "🎙 Đang ghi âm… " +
                 if (viToForeign) "(nói TIẾNG VIỆT)" else "(${selected.label})"
 
+        // SỬA LỖI "nghe được chữ mà không dịch": trên nhiều máy, dịch vụ
+        // nhận dạng trả CHỮ NHÁP (partial) đầy đủ trong lúc nói nhưng khi
+        // kết thúc lại KHÔNG gửi kết quả cuối (onResults) mà báo lỗi
+        // NO_MATCH. → Giữ lại bản chữ nháp tốt nhất; kết quả cuối không về
+        // thì dùng chính bản nháp đó để dịch — không mất câu nào nữa.
+        var lastPartial = ""
+        var handled = false
+
+        fun processText(text: String) {
+            if (handled || text.isBlank()) return
+            handled = true
+            appendSystemLog("🎙 Nghe được: \"$text\" — đang dịch…")
+            tvStatus.text = "Đang dịch…"
+            handleRecognized(text, viToForeign)
+        }
+
         recognizer?.setRecognitionListener(object : RecognitionListener {
             override fun onResults(results: Bundle) {
                 val text = results
                     .getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                     ?.firstOrNull()
-                if (text.isNullOrBlank()) {
+                    ?.takeIf { it.isNotBlank() }
+                    ?: lastPartial // kết quả cuối rỗng → dùng bản nháp
+                if (text.isBlank()) {
                     tvStatus.text = "Không nghe thấy gì, bấm nút nói lại"
                     return
                 }
-                // HIỆN NGAY câu nghe được — dù khâu dịch có chậm/kẹt thì
-                // phụ đề cuộc trao đổi vẫn luôn xuất hiện tức thì
-                appendSystemLog("🎙 Nghe được: \"$text\" — đang dịch…")
-                tvStatus.text = "Đang dịch…"
-                handleRecognized(text, viToForeign)
+                processText(text)
             }
 
             override fun onPartialResults(partial: Bundle) {
                 val t = partial.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
                     ?.firstOrNull()
-                if (!t.isNullOrBlank()) tvStatus.text = "🎙 $t"
+                if (!t.isNullOrBlank()) {
+                    lastPartial = t
+                    tvStatus.text = "🎙 $t"
+                }
             }
 
             override fun onError(error: Int) {
-                // Lỗi dịch vụ: xoay sang bộ nhận dạng kế tiếp, tự thử lại tối đa 2 lần
+                // CÓ CHỮ NHÁP → dùng luôn để dịch, bất kể lỗi gì
+                if (lastPartial.isNotBlank()) {
+                    processText(lastPartial)
+                    return
+                }
+                // Chưa nghe được gì + lỗi dịch vụ: xoay bộ nhận dạng, thử lại
                 if (error in intArrayOf(4, 5, 8, 11, 12, 13) && manualRetries < 2) {
                     manualRetries++
                     sttEngineIdx = (sttEngineIdx + 1) % sttCandidates().size
@@ -382,7 +404,14 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             override fun onBeginningOfSpeech() {}
             override fun onRmsChanged(rmsdB: Float) {}
             override fun onBufferReceived(buffer: ByteArray?) {}
-            override fun onEndOfSpeech() { tvStatus.text = "Đang xử lý…" }
+            override fun onEndOfSpeech() {
+                tvStatus.text = "Đang xử lý…"
+                // Lưới an toàn cuối: 3 giây sau khi ngừng nói mà vẫn chưa có
+                // kết quả cuối lẫn lỗi → tự dùng bản chữ nháp để dịch
+                ui.postDelayed({
+                    if (!handled && lastPartial.isNotBlank()) processText(lastPartial)
+                }, 3000)
+            }
             override fun onEvent(eventType: Int, params: Bundle?) {}
         })
         recognizer?.startListening(intent)
