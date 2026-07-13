@@ -392,12 +392,18 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
     private var translateTurnId = 0
 
     /**
-     * Câu nghe được → tự phát hiện ngôn ngữ (ML Kit) → dịch đúng chiều
-     * → hiện 2 dòng (gốc + dịch) → đọc to bản dịch.
-     * Có bộ giám sát 12 giây: khâu dịch bị kẹt (thường do lần đầu phải tải
-     * mô hình dịch ~30MB mà mạng yếu) sẽ báo rõ vào ô hội thoại thay vì im lặng.
+     * CHIỀU DỊCH XÁC ĐỊNH THẲNG THEO NÚT BẤM (không qua bước nhận diện
+     * ngôn ngữ trung gian nữa — bước đó là điểm treo trên một số máy):
+     *  - Nút "Tôi nói"       → dịch Tiếng Việt → ngoại ngữ đã chọn
+     *  - Nút "Người kia nói" → dịch ngoại ngữ → Tiếng Việt
+     * Đường dịch này giống hệt chế độ dịch phim (đã chạy ổn định):
+     * gọi thẳng TranslateHelper.translate rồi hiện phụ đề + đọc to.
      */
     private fun handleRecognized(text: String, viToForeignPressed: Boolean) {
+        val isVietnamese = viToForeignPressed
+        val src = if (isVietnamese) "vi" else selected.mlkit
+        val dst = if (isVietnamese) selected.mlkit else "vi"
+
         val myTurn = ++translateTurnId
         var turnDone = false
         ui.postDelayed({
@@ -412,44 +418,28 @@ class MainActivity : AppCompatActivity(), TextToSpeech.OnInitListener {
             }
         }, 12000)
 
-        TranslateHelper.identifyLanguage(text) { detected ->
-            val isVietnamese = when (detected) {
-                "vi" -> true
-                "und" -> viToForeignPressed
-                else -> false
-            }
-            val src = if (isVietnamese) "vi" else selected.mlkit
-            val dst = if (isVietnamese) selected.mlkit else "vi"
-
-            TranslateHelper.translate(text, src, dst,
-                onResult = { translated ->
-                    runOnUiThread {
-                        if (turnDone) {
-                            // Giám sát đã báo lỗi rồi nhưng bản dịch về muộn:
-                            // vẫn hiện + đọc để không mất nội dung
-                            appendLog(isVietnamese, text, translated)
-                            if (switchSpeak.isChecked) {
-                                speak(translated, if (isVietnamese) selected.tts else Locale("vi", "VN"))
-                            }
-                            return@runOnUiThread
-                        }
-                        turnDone = true
-                        appendLog(isVietnamese, text, translated)
-                        tvStatus.text = "Sẵn sàng"
-                        if (switchSpeak.isChecked) {
-                            speak(translated, if (isVietnamese) selected.tts else Locale("vi", "VN"))
-                        }
-                    }
-                },
-                onError = { err ->
-                    runOnUiThread {
-                        turnDone = true
-                        tvStatus.text = err
-                        appendSystemLog("❌ $err — kiểm tra kết nối mạng rồi thử lại")
+        TranslateHelper.translate(text, src, dst,
+            onResult = { translated ->
+                runOnUiThread {
+                    val late = turnDone
+                    turnDone = true
+                    // Luôn hiện phụ đề (câu gốc + bản dịch) và đọc to bản dịch,
+                    // kể cả khi bản dịch về muộn sau cảnh báo — không mất nội dung
+                    appendLog(isVietnamese, text, translated)
+                    if (!late) tvStatus.text = "Sẵn sàng"
+                    if (switchSpeak.isChecked) {
+                        speak(translated, if (isVietnamese) selected.tts else Locale("vi", "VN"))
                     }
                 }
-            )
-        }
+            },
+            onError = { err ->
+                runOnUiThread {
+                    turnDone = true
+                    tvStatus.text = err
+                    appendSystemLog("❌ $err — kiểm tra kết nối mạng rồi thử lại")
+                }
+            }
+        )
     }
 
     // ================================================================
